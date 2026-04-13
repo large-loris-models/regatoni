@@ -13,6 +13,7 @@ export CXX="${CXX:-clang++}"
 
 # LLVM source
 export LLVM_SRC="$PROJECT_ROOT/deps/llvm-project"
+export LLVM_INSTALL="$PROJECT_ROOT/deps/llvm-install-sancov"
 
 # LLVM sancov build (for fuzzing) — no install, link against build dir
 export LLVM_BUILD="$PROJECT_ROOT/deps/llvm-build-sancov"
