@@ -32,3 +32,6 @@ compile_commands.json
 
 # Claude files
 CLAUDE.md
+
+# Ignore log files
+*.log
