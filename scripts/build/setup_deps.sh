@@ -56,7 +56,8 @@ if [ ! -f "$LLVM_BUILD_SANCOV/bin/opt" ]; then
         "${COMMON_CMAKE_FLAGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="$SANCOV_FLAGS" \
-        -DCMAKE_CXX_FLAGS="$SANCOV_FLAGS"
+        -DCMAKE_CXX_FLAGS="$SANCOV_FLAGS" \
+        -DLLVM_ENABLE_RTTI=ON
 
     echo "  Building opt target (to get all LLVM libraries)..."
     cmake --build "$LLVM_BUILD_SANCOV" --target opt -j"$JOBS"
@@ -80,7 +81,8 @@ if [ ! -f "$LLVM_BUILD_ASAN/bin/opt" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="$ASAN_FLAGS" \
         -DCMAKE_CXX_FLAGS="$ASAN_FLAGS" \
-        -DLLVM_USE_SANITIZER="Address;Undefined"
+        -DLLVM_USE_SANITIZER="Address;Undefined" \
+        -DLLVM_ENABLE_RTTI=ON
 
     echo "  Building opt target (asan, this will take a while)..."
     cmake --build "$LLVM_BUILD_ASAN" --target opt -j"$JOBS"
@@ -89,6 +91,16 @@ else
 fi
 
 echo "  LLVM (asan) ready: $LLVM_BUILD_ASAN"
+
+# --- LLVM build: plain (for Alive2 + tools) ---
+LLVM_BUILD_PLAIN="$DEPS_DIR/llvm-build-plain"
+
+cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD_PLAIN" \
+    "${COMMON_CMAKE_FLAGS[@]}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_ENABLE_RTTI=ON
+
+cmake --build "$LLVM_BUILD_PLAIN" --target opt -j"$JOBS"
 
 # --- Alive2 (built against sancov LLVM) ---
 echo "[4/4] Building Alive2..."
@@ -109,7 +121,9 @@ if [ ! -f "$ALIVE2_BUILD/alive-tv" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ \
-        -DCMAKE_PREFIX_PATH="$LLVM_BUILD_SANCOV"
+        -DCMAKE_PREFIX_PATH="$LLVM_BUILD_PLAIN" \
+        -DLLVM_DIR="$LLVM_BUILD_PLAIN/lib/cmake/llvm" \
+        -DBUILD_TV=ON
 
     echo "  Building Alive2..."
     cmake --build "$ALIVE2_BUILD" -j"$JOBS"
