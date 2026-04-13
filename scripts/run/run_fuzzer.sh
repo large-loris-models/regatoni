@@ -3,11 +3,12 @@
 source "$(dirname "$0")/../build/env.sh"
 
 FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target"
+ALIVE_FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target_alive2"
 FUZZ_WORKDIR="$BUILD_OUT/workdir"
 
 echo "=== Running Centipede ==="
 
-for f in "$FUZZ_TARGET" "$CENTIPEDE_BIN"; do
+for f in "$FUZZ_TARGET" "$ALIVE_FUZZ_TARGET" "$CENTIPEDE_BIN"; do
     if [[ ! -f "$f" ]]; then
         echo "ERROR: $f not found" >&2
         exit 1
@@ -24,16 +25,17 @@ if [[ -d "$SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
     echo "[run] Copied $(ls "$CORPUS_DIR" | wc -l) files"
 fi
 
-NCORES=$(nproc)
-JOBS=${FUZZ_JOBS:-$((NCORES > 4 ? 4 : NCORES))}
+JOBS=${FUZZ_JOBS:-4}
 
-echo "[run] Target:  $FUZZ_TARGET"
-echo "[run] Workdir: $FUZZ_WORKDIR"
-echo "[run] Jobs:    $JOBS"
-echo "[run] Corpus:  $CORPUS_DIR"
+echo "[run] Target:       $FUZZ_TARGET"
+echo "[run] Alive2 extra: $ALIVE_FUZZ_TARGET"
+echo "[run] Workdir:      $FUZZ_WORKDIR"
+echo "[run] Jobs:         $JOBS"
+echo "[run] Corpus:       $CORPUS_DIR"
 
 FLAGS=(
     --binary="$FUZZ_TARGET"
+    --extra_binaries="$ALIVE_FUZZ_TARGET"
     --workdir="$FUZZ_WORKDIR"
     --j="$JOBS"
     --timeout_per_input=30
