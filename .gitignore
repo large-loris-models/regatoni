@@ -9,6 +9,7 @@ deps/
 corpus/runtime/
 corpus/*.bc
 corpus/*.ll
+seeds/
 
 # Python
 __pycache__/
