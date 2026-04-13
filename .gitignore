@@ -6,9 +6,7 @@ cmake-build-*/
 deps/
 
 # Corpus runtime data (seeds checked in separately)
-corpus/runtime/
-corpus/*.bc
-corpus/*.ll
+corpus/
 seeds/
 
 # Python
