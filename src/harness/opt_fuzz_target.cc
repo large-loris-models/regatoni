@@ -28,17 +28,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 
   // Parse bytes as LLVM IR
   llvm::SMDiagnostic Err;
-	auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
-		llvm::StringRef(reinterpret_cast<const char *>(Data), Size),
-		"fuzz_input");
+  auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
+      llvm::StringRef(reinterpret_cast<const char *>(Data), Size),
+      "fuzz_input");
 
   auto M = llvm::parseIR(*Buf, Err, *Ctx);
   if (!M)
     return 0; // Not valid IR — discard
 
   // Run the default O2 pipeline
-  llvm::LoopAnalysisManager LAM;rm -rf build/workdir corpus/
-
+  llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
   llvm::ModuleAnalysisManager MAM;
