@@ -1,0 +1,33 @@
+# Build
+/build/
+cmake-build-*/
+
+# Built dependencies (LLVM, Alive2)
+deps/
+
+# Corpus runtime data (seeds checked in separately)
+corpus/runtime/
+corpus/*.bc
+corpus/*.ll
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compile commands (useful but regenerated)
+compile_commands.json
+
+# Claude files
+CLAUDE.md
