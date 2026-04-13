@@ -15,50 +15,83 @@ echo "  Deps dir:      $DEPS_DIR"
 echo ""
 
 # --- Submodules ---
-echo "[1/3] Initializing submodules..."
+echo "[1/4] Initializing submodules..."
 cd "$PROJECT_ROOT"
 git submodule update --init --recursive
 
-# --- LLVM ---
-echo "[2/3] Building LLVM from source (main)..."
+# --- LLVM source ---
+echo "[2/4] LLVM source..."
 LLVM_SRC="$DEPS_DIR/llvm-project"
-LLVM_BUILD="$DEPS_DIR/llvm-build"
-LLVM_INSTALL="$DEPS_DIR/llvm-install"
 
 if [ ! -d "$LLVM_SRC" ]; then
     echo "  Cloning llvm-project..."
     git clone https://github.com/llvm/llvm-project.git "$LLVM_SRC"
 else
-    echo "  LLVM source already present at $LLVM_SRC, skipping clone."
+    echo "  LLVM source already present, skipping clone."
 fi
 
-if [ ! -f "$LLVM_INSTALL/bin/llvm-config" ]; then
-    echo "  Configuring LLVM..."
-    cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD" \
-        -G Ninja \
+# --- Shared cmake flags ---
+COMMON_CMAKE_FLAGS=(
+    -G Ninja
+    -DCMAKE_C_COMPILER=clang
+    -DCMAKE_CXX_COMPILER=clang++
+    -DLLVM_ENABLE_PROJECTS="clang"
+    -DLLVM_TARGETS_TO_BUILD="X86"
+    -DLLVM_USE_LINKER=lld
+    -DLLVM_ENABLE_ASSERTIONS=ON
+    -DLLVM_BUILD_EXAMPLES=OFF
+    -DLLVM_BUILD_TOOLS=ON
+    -DLLVM_BUILD_UTILS=ON
+)
+
+# --- LLVM build: sancov (for fuzzing) ---
+echo "[3/4] Building LLVM (sancov)..."
+LLVM_BUILD_SANCOV="$DEPS_DIR/llvm-build-sancov"
+
+SANCOV_FLAGS="-g -O2 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp"
+
+if [ ! -f "$LLVM_BUILD_SANCOV/bin/opt" ]; then
+    echo "  Configuring LLVM (sancov)..."
+    cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD_SANCOV" \
+        "${COMMON_CMAKE_FLAGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL" \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_COMPILER=clang++ \
-        -DLLVM_ENABLE_PROJECTS="clang" \
-        -DLLVM_TARGETS_TO_BUILD="X86" \
-        -DLLVM_USE_LINKER=lld \
-        -DLLVM_ENABLE_ASSERTIONS=ON \
-        -DLLVM_OPTIMIZED_TABLEGEN=ON
+        -DCMAKE_C_FLAGS="$SANCOV_FLAGS" \
+        -DCMAKE_CXX_FLAGS="$SANCOV_FLAGS"
 
-    echo "  Building LLVM (this will take a while)..."
-    cmake --build "$LLVM_BUILD" -j"$JOBS"
-
-    echo "  Installing LLVM to $LLVM_INSTALL..."
-    cmake --install "$LLVM_BUILD"
+    echo "  Building opt target (to get all LLVM libraries)..."
+    cmake --build "$LLVM_BUILD_SANCOV" --target opt -j"$JOBS"
 else
-    echo "  LLVM already built at $LLVM_INSTALL, skipping."
+    echo "  LLVM (sancov) already built, skipping."
 fi
 
-echo "  LLVM ready: $LLVM_INSTALL"
+echo "  LLVM (sancov) ready: $LLVM_BUILD_SANCOV"
+echo "  Libraries: $(find "$LLVM_BUILD_SANCOV/lib" -name 'libLLVM*.a' | wc -l) LLVM .a files"
 
-# --- Alive2 ---
-echo "[3/3] Building Alive2..."
+# --- LLVM build: ASAN+UBSAN (for triage) ---
+echo "  Building LLVM (asan)..."
+LLVM_BUILD_ASAN="$DEPS_DIR/llvm-build-asan"
+
+ASAN_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+
+if [ ! -f "$LLVM_BUILD_ASAN/bin/opt" ]; then
+    echo "  Configuring LLVM (asan)..."
+    cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD_ASAN" \
+        "${COMMON_CMAKE_FLAGS[@]}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="$ASAN_FLAGS" \
+        -DCMAKE_CXX_FLAGS="$ASAN_FLAGS" \
+        -DLLVM_USE_SANITIZER="Address;Undefined"
+
+    echo "  Building opt target (asan, this will take a while)..."
+    cmake --build "$LLVM_BUILD_ASAN" --target opt -j"$JOBS"
+else
+    echo "  LLVM (asan) already built, skipping."
+fi
+
+echo "  LLVM (asan) ready: $LLVM_BUILD_ASAN"
+
+# --- Alive2 (built against sancov LLVM) ---
+echo "[4/4] Building Alive2..."
 ALIVE2_SRC="$DEPS_DIR/alive2"
 ALIVE2_BUILD="$DEPS_DIR/alive2/build"
 
@@ -76,8 +109,7 @@ if [ ! -f "$ALIVE2_BUILD/alive-tv" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ \
-        -DCMAKE_PREFIX_PATH="$LLVM_INSTALL" \
-        -DLLVM_DIR="$LLVM_INSTALL/lib/cmake/llvm"
+        -DCMAKE_PREFIX_PATH="$LLVM_BUILD_SANCOV"
 
     echo "  Building Alive2..."
     cmake --build "$ALIVE2_BUILD" -j"$JOBS"
@@ -90,3 +122,6 @@ echo "  Alive2 ready: $ALIVE2_BUILD"
 echo ""
 echo "=== All dependencies built ==="
 echo ""
+echo "  LLVM (sancov): $LLVM_BUILD_SANCOV"
+echo "  LLVM (asan):   $LLVM_BUILD_ASAN"
+echo "  Alive2:        $ALIVE2_BUILD"

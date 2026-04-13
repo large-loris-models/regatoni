@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+export PATH="$HOME/.local/bin:$PATH"
 
 echo "=== Regatoni: Bootstrapping fresh system ==="
 
@@ -16,10 +19,10 @@ else
 fi
 
 if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
-    echo "[1/4] Updating package lists..."
+    echo "[1/5] Updating package lists..."
     sudo apt-get update -qq
 
-    echo "[2/4] Installing build essentials..."
+    echo "[2/5] Installing build essentials..."
     sudo apt-get install -y -qq \
         build-essential \
         cmake \
@@ -31,7 +34,7 @@ if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
         zip \
         unzip
 
-    echo "[3/4] Installing LLVM/Clang build dependencies..."
+    echo "[3/5] Installing LLVM/Clang build dependencies..."
     sudo apt-get install -y -qq \
         clang \
         lld \
@@ -44,14 +47,16 @@ if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
         libxml2-dev \
         libncurses5-dev
 
-    echo "[4/4] Installing other useful tools..."
+    echo "[4/5] Installing other useful tools..."
     sudo apt-get install -y -qq \
         python3 \
         python3-pip \
         python3-venv \
         ripgrep \
         jq \
-        ccache
+        ccache \
+        re2c \
+        libz3-dev
 
 elif [[ "$DISTRO" == "alpine" ]]; then
     echo "Alpine detected..."
@@ -61,17 +66,29 @@ elif [[ "$DISTRO" == "alpine" ]]; then
         clang llvm-dev lld \
         zlib-dev ncurses-dev libxml2-dev \
         python3 py3-pip ripgrep jq ccache \
-        libgcc libstdc++
+        libgcc libstdc++ re2c z3-dev
 else
     echo "Unsupported distro: $DISTRO"
     echo "Install manually: cmake, ninja, git, clang, llvm-dev, zlib, python3"
     exit 1
 fi
 
+# Bazelisk (Bazel version manager, needed for building Centipede)
+echo "[5/5] Installing Bazelisk..."
+mkdir -p "$HOME/.local/bin"
+if ! command -v bazel &>/dev/null; then
+    curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+        -o "$HOME/.local/bin/bazel"
+    chmod +x "$HOME/.local/bin/bazel"
+    echo "  Installed Bazelisk to $HOME/.local/bin/bazel"
+else
+    echo "  Bazel already installed: $(command -v bazel)"
+fi
+
 # Verify key tools
 echo ""
 echo "=== Verifying installations ==="
-for tool in cmake ninja git clang++ llvm-config python3; do
+for tool in cmake ninja git clang++ llvm-config python3 bazel; do
     if command -v "$tool" &>/dev/null; then
         echo "  $tool ($(command -v "$tool"))"
     else
@@ -81,4 +98,3 @@ done
 
 echo ""
 echo "=== Bootstrap complete ==="
-echo "Next: ./scripts/build/setup-deps.sh"
