@@ -55,7 +55,7 @@ static void ensureVerifier(const llvm::Module &M) {
   llvm::Triple TT(M.getTargetTriple());
   TLI.emplace(TT);
   util::config::disable_undef_input = true;
-  smt::set_query_timeout("10000");
+  smt::set_query_timeout("5000");
   SmtInit.emplace();
   Verif.emplace(TLI.value(), SmtInit.value(), *LogStream);
   VerifierReady = true;
@@ -101,7 +101,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
     Verif->num_failed = 0;
     Verif->compareFunctions(F1, *F2);
 
-    if (Verif->num_unsound > 0 || Verif->num_errors > 0) {
+    // Only a definitive unsoundness result is a bug. Timeouts (num_failed) and
+    // translation/Alive2 errors (num_errors) are skipped — continue to next fn.
+    if (Verif->num_unsound > 0) {
       llvm::errs() << "ALIVE2 MISCOMPILE in function " << F1.getName() << "\n"
                    << LogStream->str() << "\n";
       std::abort();

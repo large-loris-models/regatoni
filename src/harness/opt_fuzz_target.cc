@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
@@ -81,7 +82,12 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
 
   std::mt19937 rng(Seed);
   auto &reg = regatoni::MutationRegistry::instance();
+  fprintf(stderr, "CustomMutator: invoking applyRandom (Size=%zu, Seed=%u)\n",
+          Size, Seed);
+  fflush(stderr);
   std::string applied = reg.applyRandom(*M, rng);
+  fprintf(stderr, "CustomMutator: applied mutation: '%s'\n", applied.c_str());
+  fflush(stderr);
   if (applied.empty())
     return LLVMFuzzerMutate(Data, Size, MaxSize);
 
