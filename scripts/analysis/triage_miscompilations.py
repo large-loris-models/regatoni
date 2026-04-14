@@ -28,6 +28,12 @@ CANDIDATE_PASSES = [
 
 TIMEOUT = 60
 
+FALSE_POSITIVE_MARKERS = ("function did not return!", "undef")
+
+
+def is_false_positive(alive2_err: str) -> bool:
+    return any(m in alive2_err for m in FALSE_POSITIVE_MARKERS)
+
 
 def run(cmd, timeout=TIMEOUT, input_bytes=None):
     try:
@@ -103,14 +109,35 @@ def process_file(ll_path):
 
 
 def classify(client, entry):
-    prompt = f"""Classify this LLVM miscompilation into ONE short bucket name.
+    prompt = f"""You are triaging an LLVM miscompilation reported by Alive2.
 
-Common buckets: "incorrect flag inference", "wrong constant folding",
-"bad attribute propagation", "incorrect dead code elimination",
-"unsound poison propagation", "incorrect undef handling",
-"wrong predicate simplification", "unsound memory reordering", "other".
+First, decide whether the report is a REAL miscompilation or a trivial/spurious
+one that stems from an Alive2 limitation rather than a genuine optimizer bug.
+Mark `trivial: true` when the evidence clearly points to one of:
+  - Alive2 approximating something it cannot model precisely (e.g. unsupported
+    intrinsics, inline asm, opaque external calls, volatile/atomic ordering
+    nuances, floating-point signaling/denormal corner cases Alive2 warns about)
+  - Source already has UB and the optimizer is legitimately allowed to exploit
+    it (e.g. "source is always UB", "target is more defined than source" where
+    source has clear UB like OOB access, signed overflow with nsw, etc.)
+  - Poison/undef refinement that is sound per LangRef (optimizer narrowing an
+    undef/poison value to a concrete one)
+  - Trivially equivalent IR where Alive2 flags a meaningless difference
+Mark `trivial: false` when the Alive2 error describes a concrete value/memory
+mismatch that reflects a real semantic divergence. When unsure, prefer false.
 
-Respond with JSON: {{"bucket": "...", "reason": "one sentence"}}
+Then produce a SHORT bucket label (3-7 words, lowercase, no punctuation) that
+describes the *specific kind of unsoundness Alive2 is reporting*. Derive the
+label from the actual Alive2 ERROR line and the diff between source and
+optimized IR -- do NOT pick from a fixed menu, and do NOT invent a category
+that is more abstract than what the evidence supports. Two reports should get
+the same label iff they describe the same underlying semantic divergence.
+
+Good labels look like: "return domain mismatch", "value mismatch on store",
+"target has ub source does not", "extra poison in target", "memory contents
+differ". Bad labels: generic tags like "other", "misc", "wrong optimization".
+
+Respond with JSON: {{"trivial": true|false, "bucket": "...", "reason": "one sentence tying the label (and triviality decision) to the Alive2 ERROR"}}
 
 Guilty pass: {entry['guilty_pass']}
 
@@ -125,7 +152,7 @@ Alive2 error:
 """
     try:
         resp = client.chat.completions.create(
-            model="mistral.mistral-large-3-675b-instruct",
+            model="claude-opus-4-6-v1",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -166,6 +193,13 @@ def main():
             if i % 10 == 0:
                 print(f"[triage] processed {i}/{len(files)}", file=sys.stderr)
 
+    # Drop Alive2 false positives (recursion sentinels, undef-related noise)
+    total_entries = len(entries)
+    entries = [e for e in entries if not is_false_positive(e["alive2_err"])]
+    dropped = total_entries - len(entries)
+    print(f"[triage] dropped {dropped} false positives "
+          f"(undef / 'function did not return!')", file=sys.stderr)
+
     # Dedupe
     seen = {}
     for e in entries:
@@ -181,15 +215,26 @@ def main():
     )
 
     buckets = defaultdict(list)
+    trivial = []
     for e in unique:
         cls = classify(client, e)
         e["bucket"] = cls.get("bucket", "unclassified")
         e["reason"] = cls.get("reason", "")
-        buckets[e["bucket"]].append(e)
+        e["trivial"] = bool(cls.get("trivial", False))
+        if e["trivial"]:
+            trivial.append(e)
+        else:
+            buckets[e["bucket"]].append(e)
+    print(f"[triage] LLM flagged {len(trivial)} trivial / alive2-limitation entries",
+          file=sys.stderr)
 
     # Count dups per bucket
     report = ["# Miscompilation Triage Report\n",
-              f"Total files: {len(files)}  |  Unique signatures: {len(unique)}\n"]
+              f"Total files: {len(files)}  |  "
+              f"False positives filtered: {dropped}  |  "
+              f"Real miscompilations: {len(entries)}  |  "
+              f"Unique signatures: {len(unique)}  |  "
+              f"LLM-flagged trivial: {len(trivial)}\n"]
     report.append("\n## Bucket summary\n")
     report.append("| Bucket | Unique | Total files |")
     report.append("|---|---|---|")
@@ -210,10 +255,21 @@ def main():
         report.append("<details><summary>Source IR</summary>\n\n```llvm\n"
                       + rep["src"][:2000] + "\n```\n</details>\n")
 
-    report.append("\n## All unique entries\n")
+    if trivial:
+        report.append("\n## Trivial / Alive2-limitation (LLM-filtered)\n")
+        report.append("| File | Bucket | Guilty pass | Reason |")
+        report.append("|---|---|---|---|")
+        for e in trivial:
+            report.append(
+                f"| `{e['file']}` | {e['bucket']} | `{e['guilty_pass']}` | {e['reason']} |"
+            )
+
+    report.append("\n## All unique entries (non-trivial)\n")
     report.append("| File | Bucket | Guilty pass |")
     report.append("|---|---|---|")
     for e in unique:
+        if e.get("trivial"):
+            continue
         report.append(f"| `{e['file']}` | {e['bucket']} | `{e['guilty_pass']}` |")
 
     out = MISC_DIR / "report.md"
