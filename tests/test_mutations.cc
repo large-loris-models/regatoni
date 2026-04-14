@@ -609,6 +609,27 @@ static void testMutateGep() {
   std::cout << "  [PASS] MutateGep: mutates gep, result is valid IR\n";
 }
 
+static void testMutateGepNarrowIndex() {
+  // Regression: narrow-width constant index (e.g. i8 at its max) must not
+  // trigger APInt bit-width assertion when the mutation adds/subtracts a delta.
+  for (int seed = 0; seed < 30; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, R"(
+      define ptr @f(ptr %p) {
+        %q = getelementptr i32, ptr %p, i8 127
+        %r = getelementptr i32, ptr %q, i8 -128
+        ret ptr %r
+      }
+    )");
+    MutateGep mut;
+    assert(mut.canApply(*M));
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    assert(isValid(*M) && "Module should be valid after narrow-index mutation");
+  }
+  std::cout << "  [PASS] MutateGep: narrow-width index does not overflow\n";
+}
+
 static void testMutateGepNoTargets() {
   LLVMContext Ctx;
 
@@ -819,6 +840,7 @@ int main() {
   testModifyAttributes();
   testModifyAttributesNoTargets();
   testMutateGep();
+  testMutateGepNarrowIndex();
   testMutateGepNoTargets();
   testResizeType();
   testResizeTypeNoTargets();
