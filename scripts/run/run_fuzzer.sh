@@ -35,7 +35,7 @@ echo "[run] Corpus:       $CORPUS_DIR"
 
 FLAGS=(
     --binary="$FUZZ_TARGET"
-    --extra_binaries="$ALIVE_FUZZ_TARGET"
+    # --extra_binaries="$ALIVE_FUZZ_TARGET"
     --workdir="$FUZZ_WORKDIR"
     --j="$JOBS"
     --timeout_per_input=30
