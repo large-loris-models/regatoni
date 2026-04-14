@@ -5,6 +5,9 @@ cmake-build-*/
 # Built dependencies (LLVM, Alive2)
 deps/
 
+# Environment
+.env
+
 # Corpus runtime data (seeds checked in separately)
 corpus/
 seeds/
