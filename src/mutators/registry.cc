@@ -19,6 +19,7 @@
 // #include "src/mutators/alive_mutations/modify_flags.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace regatoni {
 
@@ -39,6 +40,9 @@ std::string MutationRegistry::applyRandom(llvm::Module &M, std::mt19937 &rng) {
   // Equal weight for now — pick uniformly at random
   std::uniform_int_distribution<size_t> dist(0, applicable.size() - 1);
   auto *chosen = applicable[dist(rng)];
+
+  fprintf(stderr, "applyRandom: chose mutation: %s\n", chosen->name().c_str());
+  fflush(stderr);
 
   if (chosen->apply(M, rng))
     return chosen->name();

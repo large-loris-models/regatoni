@@ -1,5 +1,6 @@
 // src/mutators/ir_mutations/mutate_gep.cc
 #include "src/mutators/ir_mutations/mutate_gep.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include <vector>
@@ -42,12 +43,17 @@ bool MutateGep::apply(llvm::Module &M, std::mt19937 &rng) {
     std::uniform_int_distribution<size_t> pickI(0, constIdx.size() - 1);
     unsigned idx = constIdx[pickI(rng)];
     auto *CI = llvm::cast<llvm::ConstantInt>(G->getOperand(idx));
-    int64_t cur = CI->getSExtValue();
+    unsigned bw = CI->getType()->getIntegerBitWidth();
+    llvm::APInt cur = CI->getValue();
     std::uniform_int_distribution<int> delta(-2, 2);
-    int64_t d = delta(rng);
+    int d = delta(rng);
     if (d == 0)
       d = 1;
-    llvm::Constant *nv = llvm::ConstantInt::getSigned(CI->getType(), cur + d);
+    llvm::APInt wide(64, static_cast<uint64_t>(d), /*isSigned=*/true);
+    llvm::APInt nvAp = cur.sextOrTrunc(64) + wide;
+    nvAp = nvAp.sextOrTrunc(bw);
+    llvm::Constant *nv =
+        llvm::ConstantInt::get(CI->getContext(), nvAp);
     G->setOperand(idx, nv);
     return true;
   }
