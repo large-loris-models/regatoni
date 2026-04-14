@@ -8,6 +8,7 @@ deps/
 # Corpus runtime data (seeds checked in separately)
 corpus/
 seeds/
+seeds_split/
 
 # Python
 __pycache__/
