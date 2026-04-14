@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Watch a Centipede workdir for new corpus entries and verify each one with
-# the Alive2 harness. Files that make the harness abort() (exit 134) are
-# copied into miscompilations/ for triage.
+# Scan the project corpus directory and verify each file with the Alive2
+# harness. Files that make the harness abort() (exit 134) are copied into
+# miscompilations/ for triage.
 
 set -u
 
-WORKDIR="${1:-build/workdir}"
-HARNESS="./build/opt_fuzz_target_alive2"
-MISCOMP_DIR="miscompilations"
-STATE_DIR="$WORKDIR/.verify_state"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+
+CORPUS="${1:-$CORPUS_DIR}"
+HARNESS="$BUILD_OUT/opt_fuzz_target_alive2"
+MISCOMP_DIR="$PROJECT_ROOT/miscompilations"
+STATE_DIR="$PROJECT_ROOT/build/.verify_state"
 CHECKED_LIST="$STATE_DIR/checked.txt"
 LOG="$STATE_DIR/verify.log"
 INTERVAL=30
@@ -18,8 +21,8 @@ if [[ ! -x "$HARNESS" ]]; then
     echo "ERROR: harness not found or not executable: $HARNESS" >&2
     exit 1
 fi
-if [[ ! -d "$WORKDIR" ]]; then
-    echo "ERROR: workdir not found: $WORKDIR" >&2
+if [[ ! -d "$CORPUS" ]]; then
+    echo "ERROR: corpus dir not found: $CORPUS" >&2
     exit 1
 fi
 
@@ -43,18 +46,13 @@ verify_one() {
 }
 export -f verify_one
 
-echo "[verify] workdir=$WORKDIR harness=$HARNESS miscomp=$MISCOMP_DIR par=$PAR"
+echo "[verify] corpus=$CORPUS harness=$HARNESS miscomp=$MISCOMP_DIR par=$PAR"
 
 while true; do
-    # Corpus files live in workdir as corpus.* shards plus seed subdirs.
-    # Treat every regular file under workdir (except our own state) as a
-    # candidate input; the harness will reject anything that isn't valid IR.
-    mapfile -t all_files < <(find "$WORKDIR" -type f \
-        -not -path "$STATE_DIR/*" \
-        -not -name 'fuzz.log*' \
-        -not -name '*.log' 2>/dev/null | sort)
+    # Corpus files are raw (no extension), named by hash. Treat every regular
+    # file directly under the corpus dir as a candidate input.
+    mapfile -t all_files < <(find "$CORPUS" -maxdepth 1 -type f 2>/dev/null | sort)
 
-    # Diff against the checked list.
     new_files=()
     for f in "${all_files[@]}"; do
         if ! grep -Fxq "$f" "$CHECKED_LIST"; then
