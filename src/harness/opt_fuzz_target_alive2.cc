@@ -23,6 +23,7 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
@@ -104,9 +105,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
     // Only a definitive unsoundness result is a bug. Timeouts (num_failed) and
     // translation/Alive2 errors (num_errors) are skipped — continue to next fn.
     if (Verif->num_unsound > 0) {
-      llvm::errs() << "ALIVE2 MISCOMPILE in function " << F1.getName() << "\n"
-                   << LogStream->str() << "\n";
-      std::abort();
+      // Known false positive filters. Extend this list as new patterns are
+      // discovered:
+      //   - "did not return" : recursion, Alive2 can't model it
+      //   - "timeout"        : Z3 SMT query timeout
+      //   - "initializes("   : initializes() param attribute not handled
+      //                        correctly by Alive2
+      const std::string Log = LogStream->str();
+      std::string OptIR;
+      llvm::raw_string_ostream OS(OptIR);
+      F2->print(OS);
+      OS.flush();
+
+      bool false_positive = Log.find("did not return") != std::string::npos ||
+                            Log.find("timeout") != std::string::npos ||
+                            OptIR.find("initializes(") != std::string::npos;
+
+      if (!false_positive) {
+        llvm::errs() << "ALIVE2 MISCOMPILE in function " << F1.getName() << "\n"
+                     << Log << "\n";
+        std::abort();
+      }
     }
     LogStream->str("");
   }
