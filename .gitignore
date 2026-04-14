@@ -9,6 +9,7 @@ deps/
 corpus/
 seeds/
 seeds_split/
+miscompilations/
 
 # Python
 __pycache__/
