@@ -43,7 +43,7 @@ FLAGS=(
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
     --v=1
-    --max_num_crash_reports=10000
+    --max_num_crash_reports=50000
 )
 
 echo "[run] $CENTIPEDE_BIN ${FLAGS[*]} $*"

@@ -95,12 +95,18 @@ echo "  LLVM (asan) ready: $LLVM_BUILD_ASAN"
 # --- LLVM build: plain (for Alive2 + tools) ---
 LLVM_BUILD_PLAIN="$DEPS_DIR/llvm-build-plain"
 
-cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD_PLAIN" \
-    "${COMMON_CMAKE_FLAGS[@]}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DLLVM_ENABLE_RTTI=ON
+if [ ! -f "$LLVM_BUILD_PLAIN/bin/opt" ] || [ ! -f "$LLVM_BUILD_PLAIN/bin/llvm-reduce" ]; then
+    echo "  Configuring LLVM (plain)..."
+    cmake -S "$LLVM_SRC/llvm" -B "$LLVM_BUILD_PLAIN" \
+        "${COMMON_CMAKE_FLAGS[@]}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_ENABLE_RTTI=ON
 
-cmake --build "$LLVM_BUILD_PLAIN" --target opt -j"$JOBS"
+    echo "  Building LLVM (plain)..."
+    cmake --build "$LLVM_BUILD_PLAIN" --target opt llvm-reduce -j"$JOBS"
+else
+    echo "  LLVM (plain) already built, skipping."
+fi
 
 # --- Alive2 (built against sancov LLVM) ---
 echo "[4/4] Building Alive2..."
