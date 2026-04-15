@@ -4,7 +4,7 @@ source "$(dirname "$0")/../build/env.sh"
 
 FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target"
 ALIVE_FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target_alive2"
-FUZZ_WORKDIR="$BUILD_OUT/workdir"
+FUZZ_WORKDIR="$BUILD_OUT/workdir_$(date +%m%d%Y)"
 
 echo "=== Running Centipede ==="
 
@@ -19,9 +19,9 @@ mkdir -p "$FUZZ_WORKDIR"
 
 # Copy seeds into corpus dir so Centipede doesn't pollute our seeds
 mkdir -p "$CORPUS_DIR"
-if [[ -d "$SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
+if [[ -d "$SPLIT_SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
     echo "[run] Copying seeds into corpus dir..."
-    cp "$SEEDS_DIR"/* "$CORPUS_DIR/" 2>/dev/null || true
+    cp "$SPLIT_SEEDS_DIR"/* "$CORPUS_DIR/" 2>/dev/null || true
     echo "[run] Copied $(ls "$CORPUS_DIR" | wc -l) files"
 fi
 
