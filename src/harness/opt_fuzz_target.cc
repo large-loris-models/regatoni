@@ -4,6 +4,7 @@
 // - LLVMFuzzerCustomMutator: parse bytes as IR, apply a random mutation from
 //   our registry, serialize back. Falls back to libFuzzer's mutator on failure.
 
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -47,6 +48,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   if (!M)
     return 0;
 
+  llvm::StripDebugInfo(*M);
+
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
@@ -79,6 +82,8 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   auto M = llvm::parseIR(*Buf, Err, *Ctx);
   if (!M)
     return LLVMFuzzerMutate(Data, Size, MaxSize);
+
+  llvm::StripDebugInfo(*M);
 
   std::mt19937 rng(Seed);
   auto &reg = regatoni::MutationRegistry::instance();
