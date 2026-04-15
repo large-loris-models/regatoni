@@ -64,6 +64,34 @@ static bool isValid(const Module &M) {
   return !verifyModule(M, &os);
 }
 
+// Rich IR used by composability and chain-stress tests — hits many mutations.
+static const char *kRichIR = R"(
+  declare void @sink(i32)
+  define i32 @callee(i32 %a, i32 %b) {
+    %x = add i32 %a, %b
+    ret i32 %x
+  }
+  define i32 @main_fn(i32 %a, i32 %b, float %f, ptr %p) {
+  entry:
+    %s = add i32 %a, %b
+    %c = icmp slt i32 %s, %a
+    br i1 %c, label %then, label %else
+  then:
+    %r1 = call i32 @callee(i32 %a, i32 %b)
+    call void @sink(i32 %r1)
+    %g = getelementptr i32, ptr %p, i64 2
+    %u = add i32 %r1, undef
+    br label %join
+  else:
+    %r2 = fadd float %f, %f
+    %r3 = fptosi float %r2 to i32
+    br label %join
+  join:
+    %phi = phi i32 [ %u, %then ], [ %r3, %else ]
+    ret i32 %phi
+  }
+)";
+
 // ============================================================================
 // Test: SwapBinOp
 // ============================================================================
@@ -785,6 +813,85 @@ static void testEliminateUndefNoTargets() {
 }
 
 // ============================================================================
+// Test: Composability — apply every ordered pair of mutations
+// ============================================================================
+
+static void testMutationComposability() {
+  auto &reg = MutationRegistry::instance();
+  const auto &muts = reg.all();
+  const size_t N = muts.size();
+  assert(N > 0 && "Registry should have mutations");
+
+  const unsigned seeds[] = {0, 1, 2};
+  const size_t numSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+  size_t total = 0;
+  size_t valid = 0;
+  std::vector<std::string> failures;
+
+  for (size_t i = 0; i < N; ++i) {
+    for (size_t j = 0; j < N; ++j) {
+      for (size_t s = 0; s < numSeeds; ++s) {
+        LLVMContext Ctx;
+        auto M = parseIR(Ctx, kRichIR);
+        std::mt19937 rng(seeds[s]);
+        (void)muts[i]->apply(*M, rng);
+        (void)muts[j]->apply(*M, rng);
+        ++total;
+        if (isValid(*M)) {
+          ++valid;
+        } else {
+          failures.push_back(muts[i]->name() + " -> " + muts[j]->name() +
+                             " (seed " + std::to_string(seeds[s]) + ")");
+        }
+      }
+    }
+  }
+
+  for (const auto &f : failures)
+    std::cerr << "  [WARN] Composability failure: " << f << "\n";
+
+  assert(valid * 10 >= total * 9 &&
+         "At least 90% of mutation pairs should produce valid IR");
+
+  std::cout << "  [PASS] Composability: " << N << "x" << N << "x" << numSeeds
+            << " mutation pairs, " << valid << "/" << total
+            << " produced valid IR\n";
+}
+
+// ============================================================================
+// Test: Chain stress — apply 20 random mutations in sequence
+// ============================================================================
+
+static void testMutationChainStress() {
+  auto &reg = MutationRegistry::instance();
+  const int kTrials = 10;
+  const int kChainLen = 20;
+
+  for (int trial = 0; trial < kTrials; ++trial) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kRichIR);
+    std::mt19937 rng(trial);
+    std::vector<std::string> chain;
+    for (int step = 0; step < kChainLen; ++step) {
+      std::string applied = reg.applyRandom(*M, rng);
+      if (!applied.empty())
+        chain.push_back(applied);
+    }
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] ChainStress trial " << trial
+                << " produced invalid IR after sequence:\n";
+      for (size_t i = 0; i < chain.size(); ++i)
+        std::cerr << "    " << i << ": " << chain[i] << "\n";
+      assert(false && "Mutation chain produced invalid IR");
+    }
+  }
+
+  std::cout << "  [PASS] ChainStress: " << kTrials << " trials x " << kChainLen
+            << " mutations, all produced valid IR\n";
+}
+
+// ============================================================================
 // Test: Registry
 // ============================================================================
 
@@ -848,6 +955,8 @@ int main() {
   testMutateUnaryNoTargets();
   testEliminateUndef();
   testEliminateUndefNoTargets();
+  testMutationComposability();
+  testMutationChainStress();
   testRegistry();
 
   std::cout << "\nAll tests passed.\n";
