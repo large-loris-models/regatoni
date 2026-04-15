@@ -48,6 +48,8 @@ export FUZZ_CFLAGS=(
 # Corpus / seeds
 export CORPUS_DIR="$PROJECT_ROOT/corpus"
 export SEEDS_DIR="$PROJECT_ROOT/seeds"
+export SPLIT_SEEDS_DIR="$PROJECT_ROOT/seeds_split"
+
 
 # Build output
 export BUILD_OUT="$PROJECT_ROOT/build"
