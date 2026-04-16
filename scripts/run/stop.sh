@@ -77,7 +77,7 @@ fi
 
 miscomp_count=0
 if [[ -d "$PROJECT_ROOT/miscompilations" ]]; then
-    miscomp_count="$(find "$PROJECT_ROOT/miscompilations" -maxdepth 1 -type f -name '*.ll' 2>/dev/null | wc -l)"
+    miscomp_count="$(find "$PROJECT_ROOT/miscompilations" -maxdepth 1 -type f 2>/dev/null | wc -l)"
 fi
 
 log "────────────────────────────────────────"
