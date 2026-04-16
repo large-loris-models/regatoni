@@ -136,10 +136,10 @@ else
     latest=$(grep -oE 'ft: [0-9]+ cov: [0-9]+ cnt: [0-9]+ cmp: [0-9]+' "$RUN_LOG" | tail -1)
     if [[ -n "$latest" ]]; then
         read -r _ ft _ cov _ cnt _ cmp <<<"$latest"
-        printf "  Total feats:   %s\n" "$ft"
+        printf "  Total features:   %s\n" "$ft"
         printf "  PC coverage:   %s\n" "$cov"
-        printf "  Counter feats: %s\n" "$cnt"
-        printf "  Cmp feats:     %s\n" "$cmp"
+        printf "  Counter features: %s\n" "$cnt"
+        printf "  Cmp features:     %s\n" "$cmp"
     fi
 
     avg_exec=$(awk '
