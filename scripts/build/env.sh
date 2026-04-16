@@ -60,6 +60,9 @@ export SEEDS_DIR="$PROJECT_ROOT/seeds"
 export SPLIT_SEEDS_DIR="$PROJECT_ROOT/seeds_split"
 
 
+# Symbolizer (for sanitizer stack traces)
+export LLVM_SYMBOLIZER_PATH="/usr/bin/llvm-symbolizer"
+
 # Build output
 export BUILD_OUT="$PROJECT_ROOT/build"
 
