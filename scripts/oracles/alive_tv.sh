@@ -42,6 +42,8 @@ alive_tv_check() {
 
     if [[ "$verdict" == "fail" ]]; then
         cp -n "$ir_file" "$MISCOMP_DIR/$(basename "$ir_file")" 2>/dev/null || true
+        # Kick off reduction in the background.
+        "$SCRIPT_DIR/reduce_miscompilation.sh" "$MISCOMP_DIR/$(basename "$ir_file")"
     fi
 }
 
