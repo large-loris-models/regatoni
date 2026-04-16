@@ -178,8 +178,8 @@ FUZZER_FLAGS=(
     --binary="$FUZZ_TARGET"
     --workdir="$FUZZ_WORKDIR"
     --j="$FUZZER_CORES"
-    --timeout_per_input=30
-    --rss_limit_mb=0
+    --timeout_per_input=10
+    --rss_limit_mb=8142
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
     --use_counter_features
