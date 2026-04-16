@@ -21,7 +21,11 @@
 #include "src/mutators/ir_mutations/resize_type.h"
 #include "src/mutators/ir_mutations/mutate_unary.h"
 #include "src/mutators/ir_mutations/eliminate_undef.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
@@ -124,6 +128,73 @@ static void testSwapBinOp() {
   assert(isValid(*M) && "Module should still be valid after mutation");
 
   std::cout << "  [PASS] SwapBinOp: mutates binops, result is valid IR\n";
+}
+
+// Regression: when we swap an opcode across classes (e.g. Add with nsw/nuw
+// flags to a bitwise Xor, or to a UDiv that has an `exact` flag instead),
+// the replacement must not carry flags that are meaningless or illegal for
+// the new opcode. We create a fresh BinaryOperator rather than mutating in
+// place, so stale flags cannot leak. The `randomizeFlags` pass only sets
+// flags appropriate to the new opcode class.
+static void testSwapBinOpNoStaleFlags() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add nsw nuw i32 %a, %b
+      %y = mul nsw nuw i32 %x, %a
+      %z = shl nsw nuw i32 %y, %a
+      %q = sdiv exact i32 %z, %b
+      %r = lshr exact i32 %q, %b
+      ret i32 %r
+    }
+  )";
+  SwapBinOp mut;
+  for (int seed = 0; seed < 200; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] SwapBinOp produced invalid IR (seed " << seed
+                << "):\n"
+                << moduleToString(*M);
+      assert(false);
+    }
+    // For every binop in the module, the flags present must be legal for
+    // its current opcode. We check the specific case that motivated the
+    // fix: flags set on an opcode that doesn't support them.
+    for (auto &F : *M) {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I);
+          if (!BO)
+            continue;
+          auto op = BO->getOpcode();
+          bool hasNUW =
+              llvm::isa<llvm::OverflowingBinaryOperator>(BO) &&
+              BO->hasNoUnsignedWrap();
+          bool hasNSW =
+              llvm::isa<llvm::OverflowingBinaryOperator>(BO) &&
+              BO->hasNoSignedWrap();
+          bool hasExact =
+              llvm::isa<llvm::PossiblyExactOperator>(BO) && BO->isExact();
+          bool nuwNswOk = op == llvm::Instruction::Add ||
+                          op == llvm::Instruction::Sub ||
+                          op == llvm::Instruction::Mul ||
+                          op == llvm::Instruction::Shl;
+          bool exactOk = op == llvm::Instruction::UDiv ||
+                         op == llvm::Instruction::SDiv ||
+                         op == llvm::Instruction::LShr ||
+                         op == llvm::Instruction::AShr;
+          assert((!(hasNUW || hasNSW) || nuwNswOk) &&
+                 "NUW/NSW on opcode that doesn't support it");
+          assert((!hasExact || exactOk) &&
+                 "exact flag on opcode that doesn't support it");
+        }
+      }
+    }
+  }
+  std::cout
+      << "  [PASS] SwapBinOp: 200 seeds with nsw/nuw/exact inputs, no stale flags\n";
 }
 
 static void testSwapBinOpNoTargets() {
@@ -331,6 +402,162 @@ static void testReplaceOperandNoTargets() {
   std::cout << "  [PASS] ReplaceOperand: rejects module with no targets\n";
 }
 
+// Regression: dominance must be honored across basic blocks. The old
+// implementation only collected candidates from the target's own BB, so
+// cross-BB hazards couldn't appear. The new implementation widens the
+// pool to every dominating value in the function, which is only safe if
+// we actually filter by DominatorTree. If we accidentally admit a value
+// from a non-dominating BB (a later-function-position BB, say), the
+// result is a forward reference that fails verifyModule and hangs
+// opt -O2 on the fuzzing harness.
+static void testReplaceOperandDominanceMultiBB() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b) {
+    entry:
+      %ea = add i32 %a, %b
+      %ec = icmp slt i32 %ea, %a
+      br i1 %ec, label %then, label %else
+    then:
+      %ta = mul i32 %ea, %a
+      %tc = icmp eq i32 %ta, %ea
+      br label %join
+    else:
+      %elA = sub i32 %a, %b
+      %elC = icmp ne i32 %elA, %b
+      br label %join
+    join:
+      %ja = phi i32 [ %ta, %then ], [ %elA, %else ]
+      %jc = icmp sgt i32 %ja, %a
+      %jr = add i32 %ja, %ea
+      ret i32 %jr
+    }
+  )";
+
+  ReplaceOperand mut;
+  for (int seed = 0; seed < 200; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] ReplaceOperand produced invalid IR (seed "
+                << seed << "):\n"
+                << moduleToString(*M);
+      assert(false && "ReplaceOperand created invalid IR across BBs");
+    }
+  }
+
+  std::cout
+      << "  [PASS] ReplaceOperand: 200 seeds on multi-BB IR, all valid\n";
+}
+
+// Stress: repeated ReplaceOperand on multi-BB IR must not create forward
+// references. verifyModule catches use-before-def.
+static void testReplaceOperandChainStress() {
+  const char *kIR = R"(
+    define i32 @g(i32 %a, i32 %b, i32 %c) {
+    e:
+      %ea = add i32 %a, %b
+      %eb = add i32 %b, %c
+      %ec = icmp slt i32 %ea, %eb
+      br i1 %ec, label %L, label %R
+    L:
+      %la = mul i32 %ea, %a
+      %lb = mul i32 %eb, %b
+      %lc = icmp ne i32 %la, %lb
+      br label %J
+    R:
+      %ra = sub i32 %ea, %eb
+      %rb = xor i32 %ea, %eb
+      %rc = icmp eq i32 %ra, %rb
+      br label %J
+    J:
+      %ja = phi i32 [ %la, %L ], [ %ra, %R ]
+      %jb = phi i32 [ %lb, %L ], [ %rb, %R ]
+      %jr = add i32 %ja, %jb
+      ret i32 %jr
+    }
+  )";
+  ReplaceOperand mut;
+  for (int trial = 0; trial < 20; ++trial) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(trial);
+    for (int step = 0; step < 25; ++step) {
+      mut.apply(*M, rng);
+      assert(isValid(*M) &&
+             "ReplaceOperand chain should never produce invalid IR");
+    }
+  }
+  std::cout
+      << "  [PASS] ReplaceOperand: 20 trials x 25 chained ops, all valid\n";
+}
+
+// The new implementation must accept candidates from *dominating* BBs, not
+// just the target's own BB. In the IR below, no instruction in `then`
+// originally references anything defined in `entry`. If the old
+// (same-BB-only) logic were still in effect, the mutation could never
+// introduce an `entry`-defined operand in a `then` instruction. The new
+// DominatorTree-based selection must sometimes do so.
+static void testReplaceOperandUsesDominatingBB() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b) {
+    entry:
+      %ea = add i32 %a, %b
+      br label %then
+    then:
+      %ta = mul i32 %a, %b
+      %tb = add i32 %ta, %ta
+      ret i32 %tb
+    }
+  )";
+
+  // Confirm the starting IR has no `then` operand defined in `entry`.
+  {
+    LLVMContext Ctx;
+    auto M0 = parseIR(Ctx, kIR);
+    auto *F0 = M0->getFunction("f");
+    for (auto &BB : *F0) {
+      if (BB.getName() != "then")
+        continue;
+      for (auto &I : BB) {
+        for (unsigned i = 0, e = I.getNumOperands(); i < e; ++i) {
+          auto *op = llvm::dyn_cast<llvm::Instruction>(I.getOperand(i));
+          assert(!(op && op->getParent() != &BB) &&
+                 "baseline IR must have no cross-BB operands in `then`");
+        }
+      }
+    }
+  }
+
+  ReplaceOperand mut;
+  bool sawCrossBB = false;
+  for (int seed = 0; seed < 400 && !sawCrossBB; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    assert(isValid(*M));
+    auto *F = M->getFunction("f");
+    for (auto &BB : *F) {
+      if (BB.getName() != "then")
+        continue;
+      for (auto &I : BB) {
+        for (unsigned i = 0, e = I.getNumOperands(); i < e; ++i) {
+          auto *op = llvm::dyn_cast<llvm::Instruction>(I.getOperand(i));
+          if (op && op->getParent() != &BB &&
+              op->getParent()->getName() == "entry") {
+            sawCrossBB = true;
+          }
+        }
+      }
+    }
+  }
+  assert(sawCrossBB &&
+         "ReplaceOperand should pick cross-BB dominating values");
+  std::cout << "  [PASS] ReplaceOperand: draws from dominating BBs\n";
+}
+
 // ============================================================================
 // Test: ShuffleInstructions
 // ============================================================================
@@ -428,6 +655,88 @@ static void testMoveInstruction() {
   assert(anyChanged && "MoveInstruction should change something across seeds");
 
   std::cout << "  [PASS] MoveInstruction: moves within BB, result valid\n";
+}
+
+// Regression: moves must never break SSA. Run many seeds against a
+// multi-BB function so the post-move DominatorTree verification path
+// gets exercised alongside the lo/hi bounds.
+static void testMoveInstructionDominanceMultiBB() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b, i32 %c) {
+    entry:
+      %x = add i32 %a, %b
+      %y = sub i32 %c, %a
+      %z = mul i32 %x, %y
+      %w = xor i32 %z, %b
+      %cmp = icmp slt i32 %w, %x
+      br i1 %cmp, label %L, label %R
+    L:
+      %la = add i32 %x, %z
+      %lb = mul i32 %la, %y
+      %lc = sub i32 %lb, %w
+      br label %J
+    R:
+      %ra = add i32 %y, %z
+      %rb = mul i32 %ra, %x
+      br label %J
+    J:
+      %phi = phi i32 [ %lc, %L ], [ %rb, %R ]
+      ret i32 %phi
+    }
+  )";
+  MoveInstruction mut;
+  for (int seed = 0; seed < 200; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] MoveInstruction broke SSA (seed " << seed
+                << "):\n"
+                << moduleToString(*M);
+      assert(false && "MoveInstruction produced invalid IR");
+    }
+  }
+  std::cout << "  [PASS] MoveInstruction: 200 seeds on multi-BB IR, all valid\n";
+}
+
+static void testMoveInstructionChainStress() {
+  const char *kIR = R"(
+    define i32 @g(i32 %a, i32 %b, i32 %c, i32 %d) {
+    e:
+      %x = add i32 %a, %b
+      %y = sub i32 %c, %d
+      %z = mul i32 %x, %y
+      %w = xor i32 %z, %a
+      %cmp = icmp slt i32 %w, %x
+      br i1 %cmp, label %L, label %R
+    L:
+      %la = add i32 %x, %z
+      %lb = mul i32 %la, %y
+      br label %J
+    R:
+      %ra = sub i32 %y, %z
+      %rb = xor i32 %ra, %x
+      br label %J
+    J:
+      %phi = phi i32 [ %lb, %L ], [ %rb, %R ]
+      %tail = add i32 %phi, %x
+      ret i32 %tail
+    }
+  )";
+  MoveInstruction mut;
+  for (int trial = 0; trial < 20; ++trial) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(trial);
+    for (int step = 0; step < 40; ++step) {
+      mut.apply(*M, rng);
+      assert(isValid(*M) &&
+             "MoveInstruction chain should never produce invalid IR");
+    }
+  }
+  std::cout
+      << "  [PASS] MoveInstruction: 20 trials x 40 chained moves, all valid\n";
 }
 
 static void testMoveInstructionNoTargets() {
@@ -637,6 +946,55 @@ static void testMutateGep() {
   std::cout << "  [PASS] MutateGep: mutates gep, result is valid IR\n";
 }
 
+// Regression: if we perturb a constant index on an `inbounds` GEP, the
+// result must no longer claim `inbounds`. Otherwise we risk silently
+// generating UB inputs that opt is free to miscompile around, wasting
+// Alive2 triage time. alive-mutate sidesteps this by only toggling the
+// flag; we keep index mutation but drop `inbounds` whenever we touch an
+// index.
+static void testMutateGepClearsInboundsOnIndexMutation() {
+  // A GEP whose ONLY constant-index mutation target is the `i64 2`, on an
+  // inbounds GEP. Run many seeds; every index-mutation outcome must have
+  // `inbounds` cleared, every inbounds-toggle outcome must still be valid.
+  const char *kIR = R"(
+    define ptr @f(ptr %p) {
+      %q = getelementptr inbounds [4 x i32], ptr %p, i64 0, i64 2
+      ret ptr %q
+    }
+  )";
+  MutateGep mut;
+  int sawIndexMutation = 0;
+  int sawInboundsToggle = 0;
+  for (int seed = 0; seed < 200; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    assert(isValid(*M));
+    auto *F = M->getFunction("f");
+    auto *gep =
+        llvm::cast<llvm::GetElementPtrInst>(&*F->begin()->begin());
+    auto *CI = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(2));
+    assert(CI && "final index must remain a constant");
+    bool indexChanged = CI->getValue().getSExtValue() != 2;
+    bool inboundsFlipped = !gep->isInBounds();
+    if (indexChanged) {
+      ++sawIndexMutation;
+      assert(!gep->isInBounds() &&
+             "index mutation must clear inbounds to avoid UB");
+    } else if (inboundsFlipped) {
+      ++sawInboundsToggle;
+    }
+  }
+  assert(sawIndexMutation > 0 &&
+         "should exercise the index-mutation path in 200 seeds");
+  assert(sawInboundsToggle > 0 &&
+         "should exercise the inbounds-toggle path in 200 seeds");
+  std::cout
+      << "  [PASS] MutateGep: index-mutation path always clears inbounds ("
+      << sawIndexMutation << " idx, " << sawInboundsToggle << " flag)\n";
+}
+
 static void testMutateGepNarrowIndex() {
   // Regression: narrow-width constant index (e.g. i8 at its max) must not
   // trigger APInt bit-width assertion when the mutation adds/subtracts a delta.
@@ -796,6 +1154,44 @@ static void testEliminateUndef() {
       << "  [PASS] EliminateUndef: replaces undef, result is valid IR\n";
 }
 
+// Regression: EliminateUndef shares the candidate-selection logic with
+// ReplaceOperand and previously had the same "earlier in same BB"
+// approximation. On multi-BB IR with undef operands, the replacement
+// must still honor dominance.
+static void testEliminateUndefDominanceMultiBB() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b) {
+    entry:
+      %ea = add i32 %a, %b
+      br label %L
+    L:
+      %lu = add i32 %ea, undef
+      %lv = mul i32 %lu, %a
+      %lw = sub i32 %lv, undef
+      br label %J
+    J:
+      %jp = phi i32 [ %lw, %L ]
+      %jr = add i32 %jp, %ea
+      ret i32 %jr
+    }
+  )";
+  EliminateUndef mut;
+  for (int seed = 0; seed < 200; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] EliminateUndef produced invalid IR (seed "
+                << seed << "):\n"
+                << moduleToString(*M);
+      assert(false);
+    }
+  }
+  std::cout
+      << "  [PASS] EliminateUndef: 200 seeds on multi-BB IR, all valid\n";
+}
+
 static void testEliminateUndefNoTargets() {
   LLVMContext Ctx;
 
@@ -927,6 +1323,7 @@ int main() {
   std::cout << "=== Regatoni mutation tests ===\n";
 
   testSwapBinOp();
+  testSwapBinOpNoStaleFlags();
   testSwapBinOpNoTargets();
   testSwapCmpPredicate();
   testSwapCmpPredicateNoTargets();
@@ -936,9 +1333,14 @@ int main() {
   testSwapOperandsNoTargets();
   testReplaceOperand();
   testReplaceOperandNoTargets();
+  testReplaceOperandDominanceMultiBB();
+  testReplaceOperandChainStress();
+  testReplaceOperandUsesDominatingBB();
   testShuffleInstructions();
   testShuffleInstructionsNoTargets();
   testMoveInstruction();
+  testMoveInstructionDominanceMultiBB();
+  testMoveInstructionChainStress();
   testMoveInstructionNoTargets();
   testInlineCall();
   testInlineCallNoTargets();
@@ -947,6 +1349,7 @@ int main() {
   testModifyAttributes();
   testModifyAttributesNoTargets();
   testMutateGep();
+  testMutateGepClearsInboundsOnIndexMutation();
   testMutateGepNarrowIndex();
   testMutateGepNoTargets();
   testResizeType();
@@ -954,6 +1357,7 @@ int main() {
   testMutateUnary();
   testMutateUnaryNoTargets();
   testEliminateUndef();
+  testEliminateUndefDominanceMultiBB();
   testEliminateUndefNoTargets();
   testMutationComposability();
   testMutationChainStress();
