@@ -42,6 +42,7 @@ FLAGS=(
     --rss_limit_mb=0
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
+    --use_counter_features
     --v=1
     --max_num_crash_reports=50000
 )
