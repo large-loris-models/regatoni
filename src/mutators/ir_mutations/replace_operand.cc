@@ -1,6 +1,7 @@
 // src/mutators/ir_mutations/replace_operand.cc
 #include "src/mutators/ir_mutations/replace_operand.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include <vector>
@@ -11,26 +12,41 @@ static bool isTarget(const llvm::Instruction &I) {
   return llvm::isa<llvm::BinaryOperator>(I) || llvm::isa<llvm::CmpInst>(I);
 }
 
-static void collectCandidates(llvm::Instruction *I, llvm::Type *ty,
-                              std::vector<llvm::Value *> &out) {
+// Collect values that (1) are of `ty` and (2) are legal to use as an operand
+// of `I` — i.e., they strictly dominate `I`. This mirrors alive-mutate's
+// getRandomDominatedInstruction (tools/mutator-utils/mutator.cpp:518).
+//
+// Without a dominance check, a candidate picked from a later-defined
+// instruction would form a forward reference (use-before-def) and break
+// SSA, which hangs `opt` on subsequent optimization passes.
+static void collectDominatingCandidates(llvm::Instruction *I,
+                                        llvm::DominatorTree &DT,
+                                        llvm::Type *ty,
+                                        std::vector<llvm::Value *> &out) {
   auto *F = I->getFunction();
   if (!F)
     return;
 
+  // Function arguments always dominate every instruction in F.
   for (auto &arg : F->args())
     if (arg.getType() == ty)
       out.push_back(&arg);
 
-  // Dominating instructions: earlier in the same basic block.
-  auto *BB = I->getParent();
-  for (auto &J : *BB) {
-    if (&J == I)
-      break;
-    if (J.getType() == ty)
-      out.push_back(&J);
+  // Every instruction whose definition strictly dominates I.
+  // DominatorTree::dominates(Inst, Inst) is strict: it returns false for
+  // (I, I), so I itself is correctly excluded.
+  for (auto &BB : *F) {
+    for (auto &J : BB) {
+      if (J.getType() != ty)
+        continue;
+      if (&J == I)
+        continue;
+      if (DT.dominates(&J, I))
+        out.push_back(&J);
+    }
   }
 
-  // Simple constants.
+  // Simple constants are always legal.
   if (ty->isIntegerTy()) {
     out.push_back(llvm::ConstantInt::get(ty, 0));
     out.push_back(llvm::ConstantInt::get(ty, 1));
@@ -64,6 +80,10 @@ bool ReplaceOperand::apply(llvm::Module &M, std::mt19937 &rng) {
   std::uniform_int_distribution<size_t> pickI(0, targets.size() - 1);
   auto *I = targets[pickI(rng)];
 
+  // Build a dominator tree for I's function. Rebuilding per call is O(N)
+  // and negligible next to `opt -O2` / Alive2 costs downstream.
+  llvm::DominatorTree DT(*I->getFunction());
+
   // Try both operand positions in a random order.
   std::uniform_int_distribution<unsigned> pickPos(0, 1);
   unsigned first = pickPos(rng);
@@ -71,7 +91,7 @@ bool ReplaceOperand::apply(llvm::Module &M, std::mt19937 &rng) {
     unsigned pos = (first + k) & 1u;
     llvm::Value *cur = I->getOperand(pos);
     std::vector<llvm::Value *> cands;
-    collectCandidates(I, cur->getType(), cands);
+    collectDominatingCandidates(I, DT, cur->getType(), cands);
 
     // Remove the current value from candidates.
     std::vector<llvm::Value *> filtered;

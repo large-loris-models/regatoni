@@ -1,6 +1,7 @@
 // src/mutators/ir_mutations/eliminate_undef.cc
 #include "src/mutators/ir_mutations/eliminate_undef.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include <vector>
@@ -41,6 +42,9 @@ static void collectSites(llvm::Module &M, std::vector<Site> &out) {
   }
 }
 
+// Pick a replacement value of the given type that strictly dominates `I`.
+// Using DominatorTree (rather than "earlier in same BB") avoids forward
+// references across basic blocks. Matches alive-mutate semantics.
 static llvm::Value *pickReplacement(llvm::Instruction *I, llvm::Type *ty,
                                     std::mt19937 &rng) {
   std::vector<llvm::Value *> cands;
@@ -49,12 +53,16 @@ static llvm::Value *pickReplacement(llvm::Instruction *I, llvm::Type *ty,
     for (auto &arg : F->args())
       if (arg.getType() == ty)
         cands.push_back(&arg);
-    auto *BB = I->getParent();
-    for (auto &J : *BB) {
-      if (&J == I)
-        break;
-      if (J.getType() == ty)
-        cands.push_back(&J);
+    llvm::DominatorTree DT(*F);
+    for (auto &BB : *F) {
+      for (auto &J : BB) {
+        if (J.getType() != ty)
+          continue;
+        if (&J == I)
+          continue;
+        if (DT.dominates(&J, I))
+          cands.push_back(&J);
+      }
     }
   }
   if (ty->isIntegerTy()) {

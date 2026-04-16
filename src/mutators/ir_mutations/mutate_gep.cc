@@ -55,6 +55,13 @@ bool MutateGep::apply(llvm::Module &M, std::mt19937 &rng) {
     llvm::Constant *nv =
         llvm::ConstantInt::get(CI->getContext(), nvAp);
     G->setOperand(idx, nv);
+    // Perturbing a constant index can push it past the allocated extent.
+    // On an `inbounds` GEP that is undefined behavior; opt is allowed to
+    // miscompile around it. Drop `inbounds` to keep the GEP well-defined
+    // while still exploring the index space. alive-mutate side-steps this
+    // entirely by only toggling `inbounds` and never perturbing indices
+    // (tools/mutator-utils/mutator_helper.cpp:784-808).
+    G->setIsInBounds(false);
     return true;
   }
 

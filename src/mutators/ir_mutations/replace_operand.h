@@ -7,9 +7,10 @@
 namespace regatoni {
 
 // Picks a random binary/cmp instruction and replaces one of its operands
-// with a different value of the same type: a function argument, a
-// dominating instruction (earlier in the same basic block), or a simple
-// constant (0, 1, -1, 0.0, 1.0).
+// with a different value of the same type: a function argument, an
+// instruction that strictly dominates the target (per DominatorTree), or
+// a simple constant (0, 1, -1, 0.0, 1.0). Dominance enforcement prevents
+// forward references that would break SSA.
 class ReplaceOperand : public Mutation {
 public:
   std::string name() const override { return "replace_operand"; }

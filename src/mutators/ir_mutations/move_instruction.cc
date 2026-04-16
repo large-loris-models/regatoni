@@ -1,5 +1,6 @@
 // src/mutators/ir_mutations/move_instruction.cc
 #include "src/mutators/ir_mutations/move_instruction.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include <vector>
 
@@ -12,6 +13,20 @@ static bool isMovable(const llvm::Instruction &I) {
     return false;
   if (llvm::isa<llvm::CallBase>(I))
     return false;
+  return true;
+}
+
+// Does every operand of I that is a function-local instruction still
+// strictly dominate I? Arguments and constants always do, so skip them.
+static bool operandsDominateAfterMove(llvm::Instruction *I,
+                                      llvm::DominatorTree &DT) {
+  for (unsigned op = 0, e = I->getNumOperands(); op < e; ++op) {
+    auto *D = llvm::dyn_cast<llvm::Instruction>(I->getOperand(op));
+    if (!D)
+      continue;
+    if (!DT.dominates(D, I))
+      return false;
+  }
   return true;
 }
 
@@ -99,7 +114,24 @@ bool MoveInstruction::apply(llvm::Module &M, std::mt19937 &rng) {
   if (newIdx == curIdx)
     return false;
 
-  I->moveBefore(*insts[newIdx]->getParent(), insts[newIdx]->getIterator());
+  // Record the pre-move anchor so we can roll back if the move somehow
+  // breaks SSA. The lo/hi bounds above guarantee intra-BB dominance is
+  // preserved, but we verify explicitly — a cheap guard that also protects
+  // against regressions if the guards are loosened later, mirroring how
+  // alive-mutate's fixAllValues repairs broken uses after motion
+  // (tools/mutator-utils/mutator_helper.cpp:376-493). curIdx+1 is always
+  // in range because isMovable rejects the terminator.
+  llvm::Instruction *rollbackAnchor = insts[curIdx + 1];
+  llvm::Instruction *target = insts[newIdx];
+  I->moveBefore(*target->getParent(), target->getIterator());
+
+  llvm::DominatorTree DT(*BB->getParent());
+  if (!operandsDominateAfterMove(I, DT)) {
+    I->moveBefore(*rollbackAnchor->getParent(),
+                  rollbackAnchor->getIterator());
+    return false;
+  }
+
   return true;
 }
 
