@@ -27,6 +27,15 @@ export ALIVE2_SRC="$PROJECT_ROOT/deps/alive2"
 export ALIVE2_BUILD="$PROJECT_ROOT/deps/alive2/build"
 export ALIVE_TV="$ALIVE2_BUILD/alive-tv"
 
+# Alive2 arm-tv (backend translation validation)
+export ARM_TV_BUILD="$PROJECT_ROOT/deps/alive2-arm-tv/build"
+export ARM_TV_BIN="$ARM_TV_BUILD/alive-tv"
+
+# Plain LLVM tools
+export LLVM_BUILD_PLAIN="$PROJECT_ROOT/deps/llvm-build-plain"
+export LLVM_PLAIN_LLC="$LLVM_BUILD_PLAIN/bin/llc"
+export LLVM_REDUCE="$LLVM_BUILD_PLAIN/bin/llvm-reduce"
+
 # FuzzTest / Centipede
 export FUZZTEST_SRC="$PROJECT_ROOT/third_party/fuzztest"
 export FUZZTEST_BIN="$FUZZTEST_SRC/bazel-bin/centipede"

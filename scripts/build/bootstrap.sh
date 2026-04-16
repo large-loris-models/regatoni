@@ -56,7 +56,9 @@ if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
         jq \
         ccache \
         re2c \
-        libz3-dev
+        libz3-dev \
+        antlr4 libantlr4-runtime-dev
+
 
 elif [[ "$DISTRO" == "alpine" ]]; then
     echo "Alpine detected..."
@@ -66,7 +68,8 @@ elif [[ "$DISTRO" == "alpine" ]]; then
         clang llvm-dev lld \
         zlib-dev ncurses-dev libxml2-dev \
         python3 py3-pip ripgrep jq ccache \
-        libgcc libstdc++ re2c z3-dev ibclang-rt-19-dev
+        libgcc libstdc++ re2c z3-dev ibclang-rt-19-dev \
+        
 else
     echo "Unsupported distro: $DISTRO"
     echo "Install manually: cmake, ninja, git, clang, llvm-dev, zlib, python3"
