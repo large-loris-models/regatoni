@@ -92,6 +92,17 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   if (Size == 0)
     return LLVMFuzzerMutate(Data, Size, MaxSize);
 
+  {
+    static int counter = 0;
+    char path[256];
+    snprintf(path, sizeof(path), "build/mutator_input_%03d.ll", counter % 16);
+    if (FILE *f = std::fopen(path, "w")) {
+      std::fwrite(Data, 1, Size, f);
+      std::fclose(f);
+    }
+    counter++;
+  }
+
   llvm::SMDiagnostic Err;
   auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
       llvm::StringRef(reinterpret_cast<const char *>(Data), Size),
@@ -173,6 +184,16 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   if (Out.size() > MaxSize)
     return LLVMFuzzerMutate(Data, Size, MaxSize);
 
+  {
+    static int out_counter = 0;
+    char path[256];
+    snprintf(path, sizeof(path), "build/mutator_output_%03d.ll", out_counter % 16);
+    if (FILE *f = std::fopen(path, "w")) {
+      std::fwrite(Out.data(), 1, Out.size(), f);
+      std::fclose(f);
+    }
+    out_counter++;
+  }
   std::memcpy(Data, Out.data(), Out.size());
   return Out.size();
 }
