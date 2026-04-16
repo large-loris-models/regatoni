@@ -40,7 +40,7 @@ DEFAULT_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
 default_corpus() {
     # run_fuzzer.sh creates build/workdir_<date>/ with corpus.* subdirs.
     # verify_corpus.sh uses $CORPUS_DIR. Prefer the latter if populated.
-    if [[ -d "$CORPUS_DIR" ]] && compgen -G "$CORPUS_DIR/*.ll" > /dev/null; then
+    if [[ -d "$CORPUS_DIR" ]] && compgen -G "$CORPUS_DIR/" > /dev/null; then
         echo "$CORPUS_DIR"
         return
     fi

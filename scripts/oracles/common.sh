@@ -80,7 +80,7 @@ oracle_iter_corpus() {
     local f
     while IFS= read -r -d '' f; do
         _oracle_process_one "$f" "$callback_fn"
-    done < <(find "$corpus_dir" -maxdepth 1 -type f -name '*.ll' -print0 2>/dev/null)
+    done < <(find "$corpus_dir" -maxdepth 1 -type f -print0 2>/dev/null)
 }
 
 oracle_watch_corpus() {
@@ -93,7 +93,6 @@ oracle_watch_corpus() {
         oracle_log "watching $corpus_dir (inotify)"
         local f
         while IFS= read -r f; do
-            [[ "$f" == *.ll ]] || continue
             _oracle_process_one "$corpus_dir/$f" "$callback_fn"
         done < <(inotifywait -m -q -e close_write --format '%f' "$corpus_dir")
     else
