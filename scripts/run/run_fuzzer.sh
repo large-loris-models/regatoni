@@ -39,7 +39,7 @@ FLAGS=(
     --workdir="$FUZZ_WORKDIR"
     --j="$JOBS"
     --timeout_per_input=30
-    --rss_limit_mb=0
+    --rss_limit_mb=8192
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
     --use_counter_features
