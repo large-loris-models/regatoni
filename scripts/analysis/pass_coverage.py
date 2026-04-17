@@ -31,6 +31,24 @@ PATH_FILE_RE     = re.compile(r'lib/Transforms/[A-Za-z0-9_]+/([A-Za-z0-9_]+)\.(?
 
 STATUS_IDX = {'FULL': 0, 'PARTIAL': 1, 'NONE': 2}
 
+# Subset of O2 passes that operate intraprocedurally (single function at a
+# time). These are the passes Alive2 can verify, so when --intra is set we
+# narrow the O2 Pipeline view to just this set. Includes both the base name
+# and the *Pass-suffixed variant so it matches either form produced by the
+# scanner.
+_INTRA_BASE = {
+    'SLPVectorizer', 'MergeICmps', 'ExpandMemCmp', 'SpeculativeExecution',
+    'InstSimplify', 'SimpleLoopUnswitch', 'LoopSimplifyCFG', 'LoopUnroll',
+    'LoopLoadElimination', 'LICM', 'GVN', 'ADCE', 'Float2Int', 'SROA',
+    'JumpThreading', 'EarlyCSE', 'LoopVectorize', 'LoopDistribute',
+    'Reassociate', 'ConstraintElimination', 'LoopDeletion', 'LoopIdiomRecognize',
+    'IndVarSimplify', 'MemCpyOpt', 'InstCombine', 'AggressiveInstCombine',
+    'VectorCombine', 'SimplifyCFG', 'CorrelatedValuePropagation',
+    'AlignmentFromAssumptions', 'LibCallsShrinkWrap', 'LoopUnrollPass',
+    'SimplifyCFGPass', 'InstSimplifyPass',
+}
+INTRAPROCEDURAL_PASSES = _INTRA_BASE | {n + 'Pass' for n in _INTRA_BASE if not n.endswith('Pass')}
+
 # ---------------------------------------------------------------------------
 # O2 pipeline extraction from PassBuilderPipelines.cpp
 # ---------------------------------------------------------------------------
@@ -407,6 +425,12 @@ def main():
     ap.add_argument('--bucket', help='Show only one bucket (o2, analysis, sanitizers, codegen, lto, specialized, utilities, unknown)')
     ap.add_argument('--summary', action='store_true', help='Show only the category summary')
     ap.add_argument('--all', action='store_true', help='Show all bucket detail tables')
+    ap.add_argument(
+        '--intraprocedural', '--intra', dest='intraprocedural',
+        action='store_true',
+        help='Restrict the O2 Pipeline view to intraprocedural passes that '
+             'Alive2 can verify',
+    )
     args = ap.parse_args()
 
     repo_root = Path.cwd()
@@ -434,6 +458,15 @@ def main():
             (name, f, p, n, total, touched, full_pct)
         )
 
+    o2_label = 'O2 Pipeline'
+    if args.intraprocedural:
+        o2_label = 'Intraprocedural O2 Passes'
+        rows_by_bucket['O2 Pipeline'] = [
+            r for r in rows_by_bucket['O2 Pipeline']
+            if r[0] in INTRAPROCEDURAL_PASSES
+        ]
+        rows_by_bucket[o2_label] = rows_by_bucket.pop('O2 Pipeline')
+
     for bucket, rows in rows_by_bucket.items():
         rows.sort(key=lambda r: (r[5], -r[4]))  # touched asc, then total desc
 
@@ -460,7 +493,10 @@ def main():
         f"{'-'*30:<30} {'------':>6}  {'------------':>12}  "
         f"{'---------':>9}  {'-------------':>14}"
     )
-    for bucket in BUCKETS_ORDER:
+    bucket_order = [
+        o2_label if b == 'O2 Pipeline' else b for b in BUCKETS_ORDER
+    ]
+    for bucket in bucket_order:
         rows = rows_by_bucket[bucket]
         npasses = len(rows)
         if npasses == 0:
@@ -482,6 +518,8 @@ def main():
     if args.bucket:
         key = args.bucket.lower()
         target = BUCKET_ALIASES.get(key, args.bucket)
+        if target == 'O2 Pipeline':
+            target = o2_label
         if target not in rows_by_bucket:
             sys.stderr.write(f"Unknown bucket '{args.bucket}'. Choose from:\n")
             for name in BUCKETS_ORDER:
@@ -491,12 +529,12 @@ def main():
         return 0
 
     if args.all:
-        for bucket in BUCKETS_ORDER:
+        for bucket in bucket_order:
             print_bucket_table(bucket, rows_by_bucket[bucket])
         return 0
 
     # Default: just O2 Pipeline detail (most interesting).
-    print_bucket_table('O2 Pipeline', rows_by_bucket['O2 Pipeline'])
+    print_bucket_table(o2_label, rows_by_bucket[o2_label])
     print("(use --all for all buckets, --bucket <name> for a specific one, --summary to hide details)")
     return 0
 
