@@ -13,7 +13,9 @@ fi
 
 cd "$FUZZTEST_SRC"
 echo "[centipede] Building with Bazel..."
-bazel build -c opt centipede:all
+bazel build -c opt centipede:all \
+    --features=-layering_check \
+    --host_features=-layering_check
 
 for f in "$CENTIPEDE_BIN" "$CENTIPEDE_RUNNER"; do
     if [[ ! -f "$f" ]]; then
