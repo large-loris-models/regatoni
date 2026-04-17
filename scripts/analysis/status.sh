@@ -16,7 +16,13 @@ RUN_LOG="${1:-$BUILD_OUT/run_state/run.log}"
 PIDS_FILE="$BUILD_OUT/run_state/pids"
 ORACLE_ROOT="$BUILD_OUT/oracle_results"
 ASAN_DIR="$ORACLE_ROOT/asan_opt"
-ALIVE_DIR="$ORACLE_ROOT/alive_tv"
+# Alive-TV may run sharded (alive_tv_0/, alive_tv_1/, ...) or unsharded (alive_tv/).
+mapfile -t ALIVE_DIRS < <(
+    if [[ -d "$ORACLE_ROOT" ]]; then
+        find "$ORACLE_ROOT" -maxdepth 1 -type d \
+            \( -name 'alive_tv' -o -name 'alive_tv_*' \) | sort
+    fi
+)
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -234,15 +240,21 @@ fi
 hdr "Section 4: Alive-TV Miscompilations"
 
 unique_miscomps=0
-if [[ ! -d "$ALIVE_DIR" ]]; then
+if (( ${#ALIVE_DIRS[@]} == 0 )); then
     echo "  not started"
 else
-    a_pass=$(find "$ALIVE_DIR/pass"    -maxdepth 1 -type f 2>/dev/null | wc -l)
-    a_fail=$(find "$ALIVE_DIR/fail"    -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)
-    a_to=$(find "$ALIVE_DIR/timeout"   -maxdepth 1 -type f 2>/dev/null | wc -l)
-    a_err=$(find "$ALIVE_DIR/error"    -maxdepth 1 -type f 2>/dev/null | wc -l)
-    a_chk=0
-    [[ -f "$ALIVE_DIR/checked.log" ]] && a_chk=$(wc -l < "$ALIVE_DIR/checked.log")
+    a_pass=0; a_fail=0; a_to=0; a_err=0; a_chk=0
+    for d in "${ALIVE_DIRS[@]}"; do
+        a_pass=$(( a_pass + $(find "$d/pass"    -maxdepth 1 -type f 2>/dev/null | wc -l) ))
+        a_fail=$(( a_fail + $(find "$d/fail"    -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l) ))
+        a_to=$((   a_to   + $(find "$d/timeout" -maxdepth 1 -type f 2>/dev/null | wc -l) ))
+        a_err=$((  a_err  + $(find "$d/error"   -maxdepth 1 -type f 2>/dev/null | wc -l) ))
+        [[ -f "$d/checked.log" ]] && a_chk=$(( a_chk + $(wc -l < "$d/checked.log") ))
+    done
+    if (( ${#ALIVE_DIRS[@]} > 1 )); then
+        printf "  Shards: %d (%s)\n" "${#ALIVE_DIRS[@]}" \
+            "$(printf '%s ' "${ALIVE_DIRS[@]##*/}")"
+    fi
     printf "  Progress: checked=%d  pass=%d  fail=%d  timeout=%d  error=%d\n\n" \
         "$a_chk" "$a_pass" "$a_fail" "$a_to" "$a_err"
 
@@ -250,9 +262,11 @@ else
         echo "  no miscompilations"
     else
         ALIVE_TSV="$TMP/alive.tsv"; : > "$ALIVE_TSV"
-        for f in "$ALIVE_DIR/fail"/*.log; do
-            [[ -e "$f" ]] || continue
-            parse_alive_log "$f" >> "$ALIVE_TSV"
+        for d in "${ALIVE_DIRS[@]}"; do
+            for f in "$d/fail"/*.log; do
+                [[ -e "$f" ]] || continue
+                parse_alive_log "$f" >> "$ALIVE_TSV"
+            done
         done
 
         ALIVE_DEDUP="$TMP/alive_dedup.tsv"

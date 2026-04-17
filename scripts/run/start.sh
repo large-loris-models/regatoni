@@ -52,15 +52,17 @@ detect_cores() {
 
 mapfile -t ALL_CORES < <(detect_cores)
 FUZZER_CORES=${FUZZ_JOBS:-4}
+ALIVE_SHARDS=3
 
-if (( ${#ALL_CORES[@]} < FUZZER_CORES + 2 )); then
-    log "WARNING: only ${#ALL_CORES[@]} cores available; oracles may share cores with fuzzer"
+# Layout: FUZZER_CORES fuzzer + ALIVE_SHARDS alive-tv + 1 ASAN.
+NEEDED=$(( FUZZER_CORES + ALIVE_SHARDS + 1 ))
+if (( ${#ALL_CORES[@]} < NEEDED )); then
+    log "WARNING: only ${#ALL_CORES[@]} cores available (need $NEEDED); oracles may share cores"
 fi
 
 # Cores after the fuzzer's allocation are for oracles.
 ORACLE_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
-ALIVE_CORE="${ORACLE_CORES[0]:-${ALL_CORES[0]}}"
-ASAN_CORE="${ORACLE_CORES[1]:-${ALL_CORES[0]}}"
+ASAN_CORE="${ORACLE_CORES[$ALIVE_SHARDS]:-${ALL_CORES[0]}}"
 
 # ── Check required binaries ─────────────────────────────────────────────────
 
@@ -207,11 +209,18 @@ fi
 
 ORACLE_DIR="$SCRIPT_DIR/../oracles"
 
-log "Starting alive-tv oracle on core $ALIVE_CORE..."
-taskset -c "$ALIVE_CORE" "$ORACLE_DIR/alive_tv.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>&1 &
-ALIVE_PID=$!
-record_pid "alive_tv" "$ALIVE_PID"
-log "alive-tv oracle PID: $ALIVE_PID (core $ALIVE_CORE)"
+declare -a ALIVE_PIDS=()
+declare -a ALIVE_USED_CORES=()
+for shard in $(seq 0 $((ALIVE_SHARDS - 1))); do
+    core="${ORACLE_CORES[$shard]:-${ALL_CORES[0]}}"
+    log "Starting alive-tv oracle shard $shard on core $core..."
+    taskset -c "$core" "$ORACLE_DIR/alive_tv.sh" "$CORPUS_DIR" "$shard" "$ALIVE_SHARDS" >> "$RUN_LOG" 2>&1 &
+    pid=$!
+    record_pid "alive_tv_$shard" "$pid"
+    ALIVE_PIDS+=("$pid")
+    ALIVE_USED_CORES+=("$core")
+    log "alive-tv oracle shard $shard PID: $pid (core $core)"
+done
 
 log "Starting ASAN oracle on core $ASAN_CORE..."
 taskset -c "$ASAN_CORE" "$ORACLE_DIR/asan_opt.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>&1 &
@@ -226,7 +235,9 @@ log "═════════════════════════
 log "  Fuzzing pipeline running"
 log "═══════════════════════════════════════════════"
 log "  fuzzer      PID $FUZZER_PID   cores ${ALL_CORES[*]:0:$FUZZER_CORES}"
-log "  alive_tv    PID $ALIVE_PID   core  $ALIVE_CORE"
+for i in "${!ALIVE_PIDS[@]}"; do
+    log "  alive_tv_$i  PID ${ALIVE_PIDS[$i]}   core  ${ALIVE_USED_CORES[$i]}"
+done
 log "  asan_opt    PID $ASAN_PID   core  $ASAN_CORE"
 log "───────────────────────────────────────────────"
 log "  corpus:     $CORPUS_DIR"

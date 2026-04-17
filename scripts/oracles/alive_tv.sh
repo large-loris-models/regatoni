@@ -7,8 +7,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-# Alive2 SMT queries are slower than plain opt; bump default timeout.
-ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-60}"
+# Most valid IR processes in under 1 second; longer runs are timeouts or
+# extremely complex queries that aren't worth blocking the oracle for.
+ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-4}"
 
 HARNESS="$BUILD_OUT/opt_fuzz_target_alive2"
 MISCOMP_DIR="$PROJECT_ROOT/miscompilations"
@@ -19,6 +20,8 @@ if [[ ! -x "$HARNESS" ]]; then
 fi
 
 CORPUS="${1:-$CORPUS_DIR}"
+ORACLE_SHARD_ID="${2:-0}"
+ORACLE_TOTAL_SHARDS="${3:-1}"
 mkdir -p "$MISCOMP_DIR"
 
 oracle_init "alive_tv"
@@ -38,7 +41,7 @@ alive_tv_check() {
         *)   verdict="error" ;;
     esac
 
-    oracle_record_result "alive_tv" "$ir_file" "$verdict" "$output"
+    oracle_record_result "$ORACLE_NAME" "$ir_file" "$verdict" "$output"
 
     if [[ "$verdict" == "fail" ]]; then
         cp -n "$ir_file" "$MISCOMP_DIR/$(basename "$ir_file")" 2>/dev/null || true

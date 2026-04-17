@@ -13,6 +13,10 @@ source "$SCRIPT_DIR/../build/env.sh" >/dev/null
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-30}"
 ORACLE_RESULTS_ROOT="$BUILD_OUT/oracle_results"
 
+# Sharding: each shard processes a deterministic subset of files.
+ORACLE_SHARD_ID="${ORACLE_SHARD_ID:-0}"
+ORACLE_TOTAL_SHARDS="${ORACLE_TOTAL_SHARDS:-1}"
+
 # Populated by oracle_init
 ORACLE_NAME=""
 ORACLE_DIR=""
@@ -27,6 +31,9 @@ oracle_log() {
 
 oracle_init() {
     local name="$1"
+    if (( ORACLE_TOTAL_SHARDS > 1 )); then
+        name="${name}_${ORACLE_SHARD_ID}"
+    fi
     ORACLE_NAME="$name"
     ORACLE_DIR="$ORACLE_RESULTS_ROOT/$name"
     ORACLE_CHECKED_LOG="$ORACLE_DIR/checked.log"
@@ -57,6 +64,14 @@ _oracle_process_one() {
     local callback_fn="$2"
     local base
     base="$(basename "$ir_file")"
+
+    if (( ORACLE_TOTAL_SHARDS > 1 )); then
+        local hash
+        hash=$(printf '%s' "$base" | cksum | awk '{print $1}')
+        if (( hash % ORACLE_TOTAL_SHARDS != ORACLE_SHARD_ID )); then
+            return 0
+        fi
+    fi
 
     if [[ -n "${ORACLE_CHECKED[$base]:-}" ]]; then
         return 0
