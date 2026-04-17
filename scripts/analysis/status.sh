@@ -101,7 +101,12 @@ parse_alive_log() {
            | sed 's/^ALIVE2 MISCOMPILE in function //' || true)
     err=$(grep -m1 '^ERROR:' "$f" 2>/dev/null | sed 's/^ERROR: //' || true)
     reduced="-"
-    [[ -f "${f%.log}.reduced.ll" ]] && reduced="yes"
+
+    local base_stem
+    base_stem=$(basename "$f" .ll.log)
+    local reduced_candidate="$PROJECT_ROOT/miscompilations/${base_stem}.reduced.ll"
+    [[ -f "$reduced_candidate" ]] && reduced="yes"
+
     printf '%s\t%s\t%s\t%s\n' "${func:-?}" "${err:-?}" "$reduced" "$base"
 }
 
