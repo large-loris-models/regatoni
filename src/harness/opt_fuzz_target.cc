@@ -90,7 +90,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
                                           size_t MaxSize, unsigned int Seed) {
   if (Size == 0)
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    return Size;
 
   {
     static int counter = 0;
@@ -113,7 +113,7 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   auto M = llvm::parseIR(*Buf, Err, *Ctx);
   auto t_parse_end = Clock::now();
   if (!M)
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    return Size;
 
   llvm::StripDebugInfo(*M);
 
@@ -128,10 +128,10 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   fprintf(stderr, "CustomMutator: applied mutation: '%s'\n", applied.c_str());
   fflush(stderr);
   if (applied.empty())
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    return Size;
 
   if (llvm::verifyModule(*M, nullptr))
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    return Size;
 
   // Record which mutation ran, so LLVMFuzzerTestOneInput can emit it as a
   // user feature. Index is position in the registry; +1 so that 0 (ignored
@@ -182,7 +182,7 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   }
 
   if (Out.size() > MaxSize)
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    return Size;
 
   {
     static int out_counter = 0;
