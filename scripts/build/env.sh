@@ -57,7 +57,7 @@ export FUZZ_CFLAGS=(
 # Corpus / seeds
 export CORPUS_DIR="$PROJECT_ROOT/corpus"
 export SEEDS_DIR="$PROJECT_ROOT/seeds"
-export SPLIT_SEEDS_DIR="$PROJECT_ROOT/seeds_split"
+export SPLIT_SEEDS_DIR="$PROJECT_ROOT/split_seeds"
 
 
 # Symbolizer (for sanitizer stack traces)

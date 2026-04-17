@@ -11,14 +11,12 @@ fi
 
 mkdir -p "$SEEDS_DIR"
 
-# Grab small .ll files (<10KB) from key opt pass test directories
-for dir in InstCombine SROA GVN SCCP SimplifyCFG InferAddressSpaces \
-           LoopUnroll IndVarSimplify MemCpyOpt DeadStoreElimination \
-           Reassociate LoopVectorize SLPVectorizer; do
-    SRC="$LLVM_SRC/llvm/test/Transforms/$dir"
-    [[ -d "$SRC" ]] || continue
-    find "$SRC" -name '*.ll' -size -10k -exec cp {} "$SEEDS_DIR/" \;
+
+find "$LLVM_SRC/llvm/test/Transforms" -name '*.ll' -print0 | while IFS= read -r -d '' f; do
+    dir=$(basename "$(dirname "$f")")
+    base=$(basename "$f")
+    cp "$f" "$SEEDS_DIR/${dir}__${base}"
 done
 
 TOTAL=$(find "$SEEDS_DIR" -name '*.ll' | wc -l)
-echo "[seeds] ✓ Collected $TOTAL .ll files into $SEEDS_DIR/"
+echo "[seeds] Collected $TOTAL .ll files into $SEEDS_DIR/"

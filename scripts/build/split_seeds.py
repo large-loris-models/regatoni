@@ -1,16 +1,18 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Split multi-function LLVM IR seed files into single-function files."""
+import hashlib
+import pathlib
+import re
+import sys
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SEEDS_DIR="$PROJECT_ROOT/seeds"
-OUT_DIR="$PROJECT_ROOT/seeds_split"
+IDENT = r'@("[^"]+"|[\w.$-]+)'
+ATTR_RE = re.compile(r'(#\d+)')
+META_RE = re.compile(r'(![\w.$-]+)')
 
-mkdir -p "$OUT_DIR"
+MAX_STEM_LEN = 80
+HASH_LEN = 8
+MAX_FILENAME_LEN = 200
 
-python3 - "$SEEDS_DIR" "$OUT_DIR" <<'PY'
-import os, re, sys, pathlib
-
-seeds_dir, out_dir = sys.argv[1], sys.argv[2]
 
 def strip_test_comments(line):
     s = line.lstrip()
@@ -21,6 +23,7 @@ def strip_test_comments(line):
             if body.startswith(tag):
                 return None
     return line
+
 
 def split_top_level(text):
     """Split text into top-level chunks: each define{...}, declare, target,
@@ -36,7 +39,6 @@ def split_top_level(text):
             i += 1
             continue
         if stripped.startswith('define'):
-            # find matching braces
             start = i
             buf = ''
             depth = 0
@@ -56,16 +58,13 @@ def split_top_level(text):
             fname = m.group(1).strip('"') if m else f'anon{start}'
             chunks.append(('define', fname, buf))
         else:
-            kind = 'other'
             if stripped.startswith('declare'):
-                kind = 'declare'
                 m = re.search(r'@("[^"]+"|[\w.$-]+)', stripped)
                 name = m.group(1).strip('"') if m else ''
-                chunks.append((kind, name, line))
+                chunks.append(('declare', name, line))
             elif stripped.startswith('target '):
                 chunks.append(('target', '', line))
             elif stripped.startswith('@'):
-                # global
                 m = re.match(r'@("[^"]+"|[\w.$-]+)', stripped)
                 name = m.group(1).strip('"') if m else ''
                 chunks.append(('global', name, line))
@@ -80,9 +79,6 @@ def split_top_level(text):
             i += 1
     return chunks
 
-IDENT = r'@("[^"]+"|[\w.$-]+)'
-ATTR_RE = re.compile(r'(#\d+)')
-META_RE = re.compile(r'(![\w.$-]+)')
 
 def referenced_names(text):
     ats = set(m.strip('"') for m in re.findall(IDENT, text))
@@ -90,34 +86,53 @@ def referenced_names(text):
     metas = set(META_RE.findall(text))
     return ats, attrs, metas
 
+
 def sanitize(s):
     return re.sub(r'[^\w.-]', '_', s)
 
-created = 0
-for path in sorted(pathlib.Path(seeds_dir).glob('*.ll')):
+
+def shorten_fname(fname):
+    sanitized = sanitize(fname)
+    if len(sanitized) <= MAX_STEM_LEN:
+        return sanitized
+    digest = hashlib.md5(fname.encode('utf-8')).hexdigest()[:HASH_LEN]
+    return f'{sanitized[:MAX_STEM_LEN]}_{digest}'
+
+
+def build_out_name(stem, fname):
+    name = f'{stem}.{shorten_fname(fname)}.ll'
+    if len(name) <= MAX_FILENAME_LEN:
+        return name
+    digest = hashlib.md5(f'{stem}::{fname}'.encode('utf-8')).hexdigest()[:HASH_LEN]
+    budget = MAX_FILENAME_LEN - len('.ll') - 1 - HASH_LEN - 1
+    head = f'{stem}.{shorten_fname(fname)}'[:budget]
+    return f'{head}_{digest}.ll'
+
+
+def process_file(path, out_dir):
     raw = path.read_text(errors='replace')
-    kept = []
-    for line in raw.splitlines(keepends=True):
-        r = strip_test_comments(line)
-        if r is not None:
-            kept.append(r)
+    kept = [r for r in (strip_test_comments(l) for l in raw.splitlines(keepends=True))
+            if r is not None]
     text = ''.join(kept)
 
     try:
         chunks = split_top_level(text)
     except Exception as e:
-        print(f'skip {path.name}: {e}', file=sys.stderr)
-        continue
+        return 0, f'parse error: {e}'
 
     targets = [c for c in chunks if c[0] == 'target']
     globals_ = [c for c in chunks if c[0] == 'global']
     declares = [c for c in chunks if c[0] == 'declare']
-    defines  = [c for c in chunks if c[0] == 'define']
-    attrs    = [c for c in chunks if c[0] == 'attributes']
-    metas    = [c for c in chunks if c[0] == 'metadata']
+    defines = [c for c in chunks if c[0] == 'define']
+    attrs = [c for c in chunks if c[0] == 'attributes']
+    metas = [c for c in chunks if c[0] == 'metadata']
 
+    if not defines:
+        return 0, 'no define blocks'
+
+    created = 0
     for _, fname, body in defines:
-        ats, used_attrs, used_metas = referenced_names(body)
+        ats, _, _ = referenced_names(body)
         out_parts = []
         out_parts.extend(c[2] for c in targets)
         for c in globals_:
@@ -126,16 +141,14 @@ for path in sorted(pathlib.Path(seeds_dir).glob('*.ll')):
         for c in declares:
             if c[1] in ats:
                 out_parts.append(c[2])
-        # include other defines' names referenced? we skip — user wants single fn
         out_parts.append(body)
-        # attributes referenced
-        # re-scan with included pieces
+
         combined = ''.join(out_parts)
         _, need_attrs, need_metas = referenced_names(combined)
         for c in attrs:
             if c[1] in need_attrs:
                 out_parts.append(c[2])
-        # metadata: include transitively (simple one-pass)
+
         md_map = {c[1]: c[2] for c in metas}
         included_md = set()
         frontier = set(need_metas)
@@ -150,9 +163,38 @@ for path in sorted(pathlib.Path(seeds_dir).glob('*.ll')):
         for name in sorted(included_md):
             out_parts.append(md_map[name])
 
-        out_name = f'{path.stem}.{sanitize(fname)}.ll'
-        (pathlib.Path(out_dir) / out_name).write_text(''.join(out_parts))
+        out_name = build_out_name(path.stem, fname)
+        (out_dir / out_name).write_text(''.join(out_parts))
         created += 1
+    return created, None
 
-print(f'Created {created} files in {out_dir}')
-PY
+
+def main():
+    script_dir = pathlib.Path(__file__).resolve().parent
+    project_root = script_dir.parent.parent
+
+    seeds_dir = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else project_root / 'seeds'
+    out_dir = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else project_root / 'split_seeds'
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    input_files = sorted(seeds_dir.glob('*.ll'))
+    total_created = 0
+    skipped = []
+
+    for path in input_files:
+        created, err = process_file(path, out_dir)
+        if err:
+            skipped.append((path.name, err))
+        total_created += created
+
+    print(f'Processed {len(input_files)} input files from {seeds_dir}')
+    print(f'Created {total_created} output files in {out_dir}')
+    if skipped:
+        print(f'Skipped {len(skipped)} files:')
+        for name, reason in skipped:
+            print(f'  {name}: {reason}')
+
+
+if __name__ == '__main__':
+    main()
