@@ -21,7 +21,7 @@ Ubuntu/Debian host with `sudo`. Everything else (clang, cmake, ninja, z3, bazel,
 ./scripts/build/setup_deps.sh             # LLVM (sancov/asan/plain) + Alive2
 ./scripts/build/build_centipede.sh        # Centipede fuzzing engine
 ./scripts/build/collect_seeds.sh          # grab .ll files from LLVM test suite
-./scripts/build/split_seeds.sh            # split multi-function files
+./scripts/build/split_seeds.py            # split multi-function files
 ./scripts/run/run_tests.sh                # mutation unit tests
 ./scripts/build/link_fuzz_target.sh       # build both harnesses
 ./scripts/run/start.sh                    # launch fuzzer + oracles

@@ -11,7 +11,7 @@ deps/
 # Corpus runtime data (seeds checked in separately)
 corpus/
 seeds/
-seeds_split/
+split_seeds/
 miscompilations/
 
 # Python
