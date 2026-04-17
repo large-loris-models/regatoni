@@ -167,11 +167,11 @@ trap shutdown INT TERM
 FUZZ_WORKDIR="$BUILD_OUT/workdir_$(date +%m%d%Y)"
 mkdir -p "$FUZZ_WORKDIR" "$CORPUS_DIR"
 
-# Copy seeds into corpus dir if empty (same as run_fuzzer.sh).
+# Copy seeds into corpus dir if empty
 if [[ -d "$SPLIT_SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
     log "Copying seeds into corpus dir..."
-    cp "$SPLIT_SEEDS_DIR"/* "$CORPUS_DIR/" 2>/dev/null || true
-    log "Copied $(ls "$CORPUS_DIR" | wc -l) seed files"
+    find "$SPLIT_SEEDS_DIR" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"
+    log "Copied $(find "$CORPUS_DIR" -maxdepth 1 -type f | wc -l) seed files"
 fi
 
 FUZZER_FLAGS=(
@@ -182,6 +182,7 @@ FUZZER_FLAGS=(
     --rss_limit_mb=8142
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
+    -crossover_level=0
     --use_counter_features
     --v=1
     --max_num_crash_reports=50000
