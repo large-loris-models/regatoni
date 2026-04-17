@@ -1,4 +1,4 @@
-# Regatoni
+# regatoni
 
 A coverage-guided fuzzer for LLVM optimization passes.
 
@@ -31,9 +31,10 @@ Ubuntu/Debian host with `sudo`. Everything else (clang, cmake, ninja, z3, bazel,
 
 ```bash
 nohup ./scripts/run/start.sh > build/run.log 2>&1 &
-./scripts/run/stop.sh                     
 tail -f build/run_state/run.log           # live log
 ./scripts/analysis/status.sh              # dashboard
+...
+./scripts/run/stop.sh                     
 ```
 
 PIDs for the fuzzer and oracles are tracked in `build/run_state/pids`. `stop.sh` reads that file and terminates each process in order.
