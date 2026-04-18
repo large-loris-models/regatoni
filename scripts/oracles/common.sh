@@ -65,6 +65,13 @@ _oracle_process_one() {
     local base
     base="$(basename "$ir_file")"
 
+    # Skip seed files from the LLVM test suite. Fuzzer-generated corpus
+    # entries are hash-named with no extension; .ll files are pre-existing
+    # seeds in split_seeds/ that we don't need to re-verify.
+    if [[ "$base" == *.ll ]]; then
+        return 0
+    fi
+
     if (( ORACLE_TOTAL_SHARDS > 1 )); then
         local hash
         hash=$(printf '%s' "$base" | cksum | awk '{print $1}')
