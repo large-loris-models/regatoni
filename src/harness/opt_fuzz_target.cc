@@ -89,19 +89,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 
 extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
                                           size_t MaxSize, unsigned int Seed) {
-  if (Size == 0)
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
 
-  {
-    static int counter = 0;
-    char path[256];
-    snprintf(path, sizeof(path), "build/mutator_input_%03d.ll", counter % 16);
-    if (FILE *f = std::fopen(path, "w")) {
-      std::fwrite(Data, 1, Size, f);
-      std::fclose(f);
-    }
-    counter++;
-  }
+  if (Size == 0)
+     return LLVMFuzzerMutate(Data, Size, MaxSize);   
 
   llvm::SMDiagnostic Err;
   auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
