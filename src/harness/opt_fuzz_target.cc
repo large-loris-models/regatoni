@@ -174,16 +174,6 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   if (Out.size() > MaxSize)
     return LLVMFuzzerMutate(Data, Size, MaxSize);
 
-  {
-    static int out_counter = 0;
-    char path[256];
-    snprintf(path, sizeof(path), "build/mutator_output_%03d.ll", out_counter % 16);
-    if (FILE *f = std::fopen(path, "w")) {
-      std::fwrite(Out.data(), 1, Out.size(), f);
-      std::fclose(f);
-    }
-    out_counter++;
-  }
   std::memcpy(Data, Out.data(), Out.size());
   return Out.size();
 }
