@@ -147,7 +147,7 @@ ARM_TV_BUILD="$DEPS_DIR/alive2-arm-tv/build"
 
 if [ ! -d "$ARM_TV_SRC" ]; then
     echo "  Cloning alive2 (arm-tv branch)..."
-    git clone -b arm-tv https://github.com/sairam2661/alive2-jr.git "$ARM_TV_SRC"
+    git clone -b arm-tv https://github.com/regehr/alive2.git "$ARM_TV_SRC"
 else
     echo "  arm-tv source already present, skipping clone."
 fi
