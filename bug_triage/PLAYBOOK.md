@@ -51,8 +51,8 @@ thoroughly in your report.
 
 ## Additional Resources
 
-A current LLVM tree can be around at `~/llvm-project/llvm/`.
-You may 
-
-If you have questions about LLVM semantics, you may consult
-docs/LangRef.rst`.
+A current LLVM tree can be around at `~/llvm-project/llvm/`.  You may
+consult the LLVM source code, and you may also want to run tools such
+as `opt` which can be found in `~/llvm-project/for-alive/bin/opt`. If
+you have questions about LLVM semantics, you may consult
+`~/llvm-project/llvm/docs/LangRef.rst`.
