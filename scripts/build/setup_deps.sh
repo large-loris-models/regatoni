@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DEPS_DIR="$PROJECT_ROOT/deps"
 
+source "$PROJECT_ROOT/deps.conf"
+
 JOBS="${JOBS:-$(nproc)}"
 
 mkdir -p "$DEPS_DIR"
@@ -116,9 +118,19 @@ ALIVE2_BUILD="$DEPS_DIR/alive2/build"
 
 if [ ! -d "$ALIVE2_SRC" ]; then
     echo "  Cloning alive2..."
-    git clone https://github.com/AliveToolkit/alive2.git "$ALIVE2_SRC"
+    git clone "$ALIVE2_REPO" "$ALIVE2_SRC"
 else
     echo "  Alive2 source already present, skipping clone."
+    git -C "$ALIVE2_SRC" remote set-url origin "$ALIVE2_REPO"
+fi
+
+ALIVE2_OLD_HEAD="$(git -C "$ALIVE2_SRC" rev-parse HEAD)"
+git -C "$ALIVE2_SRC" fetch origin
+git -C "$ALIVE2_SRC" checkout "$ALIVE2_REF"
+ALIVE2_NEW_HEAD="$(git -C "$ALIVE2_SRC" rev-parse HEAD)"
+if [ "$ALIVE2_OLD_HEAD" != "$ALIVE2_NEW_HEAD" ]; then
+    echo "  Alive2 ref changed ($ALIVE2_OLD_HEAD -> $ALIVE2_NEW_HEAD), forcing rebuild."
+    rm -f "$ALIVE2_BUILD/alive-tv"
 fi
 
 if [ ! -f "$ALIVE2_BUILD/alive-tv" ]; then
@@ -146,10 +158,20 @@ ARM_TV_SRC="$DEPS_DIR/alive2-arm-tv"
 ARM_TV_BUILD="$DEPS_DIR/alive2-arm-tv/build"
 
 if [ ! -d "$ARM_TV_SRC" ]; then
-    echo "  Cloning alive2 (arm-tv branch)..."
-    git clone -b arm-tv https://github.com/regehr/alive2.git "$ARM_TV_SRC"
+    echo "  Cloning alive2 (arm-tv)..."
+    git clone "$ARM_TV_REPO" "$ARM_TV_SRC"
 else
     echo "  arm-tv source already present, skipping clone."
+    git -C "$ARM_TV_SRC" remote set-url origin "$ARM_TV_REPO"
+fi
+
+ARM_TV_OLD_HEAD="$(git -C "$ARM_TV_SRC" rev-parse HEAD)"
+git -C "$ARM_TV_SRC" fetch origin
+git -C "$ARM_TV_SRC" checkout "$ARM_TV_REF"
+ARM_TV_NEW_HEAD="$(git -C "$ARM_TV_SRC" rev-parse HEAD)"
+if [ "$ARM_TV_OLD_HEAD" != "$ARM_TV_NEW_HEAD" ]; then
+    echo "  arm-tv ref changed ($ARM_TV_OLD_HEAD -> $ARM_TV_NEW_HEAD), forcing rebuild."
+    rm -f "$ARM_TV_BUILD/alive-tv"
 fi
 
 # Note, ASLP is broken-ish for LLVM Trunk. So we are disabling it, to use the hand-written lifters.
