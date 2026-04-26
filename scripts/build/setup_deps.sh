@@ -106,7 +106,7 @@ if [ ! -f "$LLVM_BUILD_PLAIN/bin/opt" ] || [ ! -f "$LLVM_BUILD_PLAIN/bin/llc" ] 
         -DLLVM_ENABLE_RTTI=ON
 
     echo "  Building LLVM (plain)..."
-    cmake --build "$LLVM_BUILD_PLAIN" --target opt llc llvm-reduce llvm-symbolizer LLVMAArch64Disassembler LLVMRISCVDisassembler LLVMX86Disassembler -j"$JOBS"
+    cmake --build "$LLVM_BUILD_PLAIN" --target opt llc llvm-reduce llvm-symbolizer llvm-as LLVMAArch64Disassembler LLVMRISCVDisassembler LLVMX86Disassembler -j"$JOBS"
 else
     echo "  LLVM (plain) already built, skipping."
 fi
