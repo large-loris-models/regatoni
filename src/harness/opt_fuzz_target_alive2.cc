@@ -27,6 +27,8 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
+#include <hiredis/hiredis.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +50,84 @@ static std::optional<Verifier> Verif;
 static std::optional<llvm_util::initializer> LlvmUtilInit;
 static bool VerifierReady = false;
 
+// Best-effort dedup cache. RedisCtx stays null if redis is unavailable; all
+// cache helpers no-op in that case so the harness behaves exactly as before.
+static redisContext *RedisCtx = nullptr;
+static const uint8_t *CurrentData = nullptr;
+static size_t CurrentSize = 0;
+
+static void initRedis() {
+  const char *host = std::getenv("REDIS_HOST");
+  if (!host || !*host)
+    host = "127.0.0.1";
+  const char *port_str = std::getenv("REDIS_PORT");
+  int port = (port_str && *port_str) ? std::atoi(port_str) : 6379;
+
+  RedisCtx = redisConnect(host, port);
+  if (!RedisCtx) {
+    std::cerr << "[cache] redisConnect returned null; proceeding without cache\n";
+    return;
+  }
+  if (RedisCtx->err) {
+    std::cerr << "[cache] redis connection failed: " << RedisCtx->errstr
+              << "; proceeding without cache\n";
+    redisFree(RedisCtx);
+    RedisCtx = nullptr;
+  }
+}
+
+static void disableRedis() {
+  if (RedisCtx) {
+    redisFree(RedisCtx);
+    RedisCtx = nullptr;
+  }
+}
+
+static bool cacheGet(const uint8_t *data, size_t size, std::string &out) {
+  if (!RedisCtx)
+    return false;
+  redisReply *reply = (redisReply *)redisCommand(
+      RedisCtx, "GET %b", reinterpret_cast<const char *>(data), size);
+  if (!reply || RedisCtx->err) {
+    if (reply)
+      freeReplyObject(reply);
+    disableRedis();
+    return false;
+  }
+  bool hit = false;
+  if (reply->type == REDIS_REPLY_STRING) {
+    out.assign(reply->str, reply->len);
+    hit = true;
+  }
+  freeReplyObject(reply);
+  return hit;
+}
+
+static void cacheSet(const uint8_t *data, size_t size, const char *verdict) {
+  if (!RedisCtx || !data || size == 0)
+    return;
+  redisReply *reply = (redisReply *)redisCommand(
+      RedisCtx, "SET %b %s", reinterpret_cast<const char *>(data), size,
+      verdict);
+  if (!reply || RedisCtx->err) {
+    if (reply)
+      freeReplyObject(reply);
+    disableRedis();
+    return;
+  }
+  freeReplyObject(reply);
+}
+
+static int verdictExitCode(const std::string &v) {
+  if (v == "pass")
+    return 0;
+  if (v == "fail")
+    return 134;
+  if (v == "timeout")
+    return 124;
+  return 1;
+}
+
 static void ensureVerifier(const llvm::Module &M) {
   if (VerifierReady)
     return;
@@ -65,6 +145,7 @@ static void ensureVerifier(const llvm::Module &M) {
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   Ctx = new llvm::LLVMContext();
   LogStream = new std::stringstream();
+  initRedis();
   return 0;
 }
 
@@ -72,20 +153,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   if (Size == 0)
     return 0;
 
+  // Dedup cache lookup. The raw IR content is the key; the value is the
+  // verdict string written by a previous run. On hit, replay the verdict
+  // via the appropriate exit code so the oracle's log capture sees it.
+  std::string Cached;
+  if (cacheGet(Data, Size, Cached)) {
+    std::cerr << "[cache] hit: " << Cached << "\n";
+    int code = verdictExitCode(Cached);
+    disableRedis();
+    std::exit(code);
+  }
+
+  // Recorded so the abort site below can write "fail" before terminating.
+  CurrentData = Data;
+  CurrentSize = Size;
+
   llvm::SMDiagnostic Err;
   auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
       llvm::StringRef(reinterpret_cast<const char *>(Data), Size),
       "fuzz_input");
 
   auto M1 = llvm::parseIR(*Buf, Err, *Ctx);
-  if (!M1)
+  if (!M1) {
+    cacheSet(Data, Size, "pass");
     return 0;
-  if (llvm::verifyModule(*M1, nullptr))
+  }
+  if (llvm::verifyModule(*M1, nullptr)) {
+    cacheSet(Data, Size, "pass");
     return 0;
+  }
 
   std::unique_ptr<llvm::Module> M2 = llvm::CloneModule(*M1);
-  if (!llvm_util::optimize_module(*M2, "O2").empty())
+  if (!llvm_util::optimize_module(*M2, "O2").empty()) {
+    cacheSet(Data, Size, "pass");
     return 0;
+  }
 
   ensureVerifier(*M1);
 
@@ -124,12 +226,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
       if (!false_positive) {
         llvm::errs() << "ALIVE2 MISCOMPILE in function " << F1.getName() << "\n"
                      << Log << "\n";
+        cacheSet(CurrentData, CurrentSize, "fail");
         std::abort();
       }
     }
     LogStream->str("");
   }
 
+  cacheSet(Data, Size, "pass");
   return 0;
 }
 
@@ -143,6 +247,7 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     auto bytes = readAll(std::cin);
     LLVMFuzzerTestOneInput(bytes.data(), bytes.size());
+    disableRedis();
     return 0;
   }
 
@@ -150,10 +255,12 @@ int main(int argc, char **argv) {
     std::ifstream f(argv[i], std::ios::binary);
     if (!f) {
       llvm::errs() << "failed to open " << argv[i] << "\n";
+      disableRedis();
       return 1;
     }
     auto bytes = readAll(f);
     LLVMFuzzerTestOneInput(bytes.data(), bytes.size());
   }
+  disableRedis();
   return 0;
 }

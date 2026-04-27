@@ -149,7 +149,7 @@ $CXX "${ALIVE_CFLAGS[@]}" -std=c++20 -frtti \
     "${ASAN_LINK_LIBS[@]}" \
     -Wl,--end-group \
     $Z3_LIB \
-    -ldl -lrt -lpthread -lm -lz -ltinfo \
+    -ldl -lrt -lpthread -lm -lz -ltinfo -lhiredis \
     -o "$ALIVE_FUZZ_TARGET"
 
 echo "[link] ✓ $ALIVE_FUZZ_TARGET ($(du -h "$ALIVE_FUZZ_TARGET" | cut -f1))"
