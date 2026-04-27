@@ -16,6 +16,11 @@
 #   triage_miscompilations.sh [--dry-run] [--force]
 #     --force  ignore the manifest, re-triage every finding from scratch
 
+# NOTE!!!!!!!!! PLEASE READ THIS!!!! 
+# TODO: Currently, I use "dangerously-skip-permissions" which is not good. We will have to
+# find the right tools required, to enable a safe sandbox mode in the future
+
+
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,19 +28,23 @@ source "$SCRIPT_DIR/../build/env.sh" >/dev/null
 
 DRY_RUN=0
 FORCE=0
-for arg in "$@"; do
-    case "$arg" in
+BACKEND_ARG=""
+while (( $# > 0 )); do
+    case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --force) FORCE=1 ;;
+        --backend) BACKEND_ARG="${2:-}"; shift ;;
+        --backend=*) BACKEND_ARG="${1#--backend=}" ;;
         -h|--help)
             sed -n '2,16p' "$0"
             exit 0
             ;;
         *)
-            echo "unknown arg: $arg" >&2
+            echo "unknown arg: $1" >&2
             exit 2
             ;;
     esac
+    shift
 done
 
 NORMALIZE="$SCRIPT_DIR/normalize_ir.py"
@@ -206,22 +215,44 @@ if (( DRY_RUN == 1 )); then
     exit 0
 fi
 
-# Locate the claude CLI. Honor $CLAUDE_BIN if set, else search $PATH and a
-# couple of common install locations.
-CLAUDE_BIN="${CLAUDE_BIN:-}"
-if [[ -z "$CLAUDE_BIN" ]]; then
+# Pick the LLM backend. Priority: $TRIAGE_BACKEND env var, then --backend
+# flag, then auto-detect (claude preferred, codex as fallback).
+BACKEND="${TRIAGE_BACKEND:-$BACKEND_ARG}"
+if [[ -z "$BACKEND" ]]; then
     if command -v claude >/dev/null 2>&1; then
-        CLAUDE_BIN="$(command -v claude)"
-    elif [[ -x "$HOME/.local/bin/claude" ]]; then
-        CLAUDE_BIN="$HOME/.local/bin/claude"
-    elif [[ -x "$HOME/.claude/local/claude" ]]; then
-        CLAUDE_BIN="$HOME/.claude/local/claude"
+        BACKEND="claude"
+    elif command -v codex >/dev/null 2>&1; then
+        BACKEND="codex"
     else
-        echo "error: 'claude' CLI not found on PATH" >&2
-        echo "  set CLAUDE_BIN to the claude executable, or install Claude Code" >&2
+        echo "error: no LLM CLI found; install 'claude' or 'codex'" >&2
         exit 2
     fi
 fi
+
+case "$BACKEND" in
+    claude|codex) ;;
+    *)
+        echo "error: unknown backend '$BACKEND' (expected 'claude' or 'codex')" >&2
+        exit 2
+        ;;
+esac
+
+if ! BACKEND_BIN="$(command -v "$BACKEND")"; then
+    echo "error: '$BACKEND' CLI not found on PATH" >&2
+    exit 2
+fi
+
+run_llm_triage() {
+    local work_dir="$1" prompt="$2"
+    case "$BACKEND" in
+        claude)
+            (cd "$work_dir" && "$BACKEND_BIN" --dangerously-skip-permissions -p "$prompt")
+            ;;
+        codex)
+            "$BACKEND_BIN" exec --dangerously-bypass-approvals-and-sandbox -C "$work_dir" "$prompt"
+            ;;
+    esac
+}
 
 if (( INCREMENTAL == 1 )); then
     PROMPT="Read TRIAGE_PLAYBOOK.md. A previous report exists at PREVIOUS_REPORT.md. New findings are the .ll and .ll.log files in this directory. Follow the incremental update instructions in the playbook."
@@ -229,12 +260,12 @@ else
     PROMPT="Read TRIAGE_PLAYBOOK.md and follow the fresh triage instructions. The .ll and .ll.log files are in this directory."
 fi
 
-echo "[triage] launching claude in $WORK_DIR ($MODE_LABEL, ${#STAGE_LIST[@]} of ${#PAIRS[@]} findings staged)..." >&2
+echo "[triage] launching $BACKEND in $WORK_DIR ($MODE_LABEL, ${#STAGE_LIST[@]} of ${#PAIRS[@]} findings staged)..." >&2
 TMP_REPORT="$(mktemp)"
-if ! (cd "$WORK_DIR" && "$CLAUDE_BIN" --dangerously-skip-permissions -p "$PROMPT" 2>>"$TRIAGE_LOG") > "$TMP_REPORT"; then
+if ! run_llm_triage "$WORK_DIR" "$PROMPT" 2>>"$TRIAGE_LOG" > "$TMP_REPORT"; then
     rc=$?
     rm -f "$TMP_REPORT"
-    echo "[triage] claude session failed (exit $rc)" >&2
+    echo "[triage] $BACKEND session failed (exit $rc)" >&2
     exit "$rc"
 fi
 mv "$TMP_REPORT" "$REPORT"
