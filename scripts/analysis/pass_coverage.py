@@ -431,6 +431,11 @@ def main():
         help='Restrict the O2 Pipeline view to intraprocedural passes that '
              'Alive2 can verify',
     )
+    ap.add_argument(
+        '--by-uncovered', dest='by_uncovered', action='store_true',
+        help='Sort pass tables by absolute NONE count (descending) instead '
+             'of by Touched%%',
+    )
     args = ap.parse_args()
 
     repo_root = Path.cwd()
@@ -467,8 +472,12 @@ def main():
         ]
         rows_by_bucket[o2_label] = rows_by_bucket.pop('O2 Pipeline')
 
+    if args.by_uncovered:
+        sort_key = lambda r: (-r[3], -r[4])  # none desc, then total desc
+    else:
+        sort_key = lambda r: (r[5], -r[4])   # touched asc, then total desc
     for bucket, rows in rows_by_bucket.items():
-        rows.sort(key=lambda r: (r[5], -r[4]))  # touched asc, then total desc
+        rows.sort(key=sort_key)
 
     covered = full_total + partial_total
     instr_total = full_total + partial_total + none_total
