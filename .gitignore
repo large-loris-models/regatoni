@@ -39,3 +39,8 @@ CLAUDE.md
 
 # Ignore log files
 *.log
+
+
+# (TEMP) Add some debug related dirs
+/docs/
+/triage/
