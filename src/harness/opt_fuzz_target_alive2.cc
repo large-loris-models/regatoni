@@ -136,6 +136,11 @@ static void ensureVerifier(const llvm::Module &M) {
   llvm::Triple TT(M.getTargetTriple());
   TLI.emplace(TT);
   util::config::disable_undef_input = true;
+  if (const char *unroll_env = std::getenv("ALIVE2_UNROLL")) {
+    unsigned n = std::atoi(unroll_env);
+    util::config::src_unroll_cnt = n;
+    util::config::tgt_unroll_cnt = n;
+  }
   smt::set_query_timeout("5000");
   SmtInit.emplace();
   Verif.emplace(TLI.value(), SmtInit.value(), *LogStream);
