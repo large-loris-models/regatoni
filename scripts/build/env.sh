@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+# Load project config (defaults, then local overrides)
+_CONF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ -f "$_CONF_ROOT/regatoni.conf" ]]; then
+    source "$_CONF_ROOT/regatoni.conf"
+fi
+if [[ -f "$_CONF_ROOT/regatoni.local.conf" ]]; then
+    source "$_CONF_ROOT/regatoni.local.conf"
+fi
+
+# Export variables consumed by child processes (the C++ harness reads these
+# from the environment).
+export ALIVE2_UNROLL="${ALIVE2_UNROLL:-0}"
+export REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
+export REDIS_PORT="${REDIS_PORT:-6379}"
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PROJECT_ROOT
 

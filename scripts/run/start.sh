@@ -51,7 +51,7 @@ detect_cores() {
 }
 
 mapfile -t ALL_CORES < <(detect_cores)
-FUZZER_CORES=${FUZZ_JOBS:-4}
+FUZZER_CORES="${FUZZER_CORES:-${FUZZ_JOBS:-4}}"
 ALIVE_SHARDS=3
 
 # Layout: FUZZER_CORES fuzzer + ALIVE_SHARDS alive-tv + 1 ASAN.
@@ -180,15 +180,28 @@ FUZZER_FLAGS=(
     --binary="$FUZZ_TARGET"
     --workdir="$FUZZ_WORKDIR"
     --j="$FUZZER_CORES"
-    --timeout_per_input=10
-    --rss_limit_mb=8142
+    --timeout_per_input="$TIMEOUT_PER_INPUT"
+    --rss_limit_mb="$RSS_LIMIT_MB"
     --address_space_limit_mb=0
     --corpus_dir="$CORPUS_DIR"
-    -crossover_level=0
+    -crossover_level="$CROSSOVER_LEVEL"
     --use_counter_features
     --v=1
     --max_num_crash_reports=50000
 )
+
+if [[ -n "${CORPUS_WEIGHT_METHOD:-}" && "$CORPUS_WEIGHT_METHOD" != "uniform" ]]; then
+    FUZZER_FLAGS+=("--corpus_weight_method=$CORPUS_WEIGHT_METHOD")
+fi
+if [[ -n "${USER_FEATURE_DOMAIN_MASK:-}" ]]; then
+    FUZZER_FLAGS+=("--user_feature_domain_mask=$USER_FEATURE_DOMAIN_MASK")
+fi
+if [[ "${USE_PCPAIR_FEATURES:-false}" == "true" ]]; then
+    FUZZER_FLAGS+=("--use_pcpair_features")
+fi
+if [[ -n "${CALLSTACK_LEVEL:-}" ]] && (( CALLSTACK_LEVEL > 0 )); then
+    FUZZER_FLAGS+=("--callstack_level=$CALLSTACK_LEVEL")
+fi
 
 log "Starting Centipede fuzzer (${FUZZER_CORES} jobs)..."
 ulimit -s unlimited
