@@ -6,6 +6,11 @@ Passes are categorized into buckets (O2 Pipeline, Analysis, Sanitizers,
 Codegen, LTO, Specialized, Utilities, Unknown). For each pass we report both
 Touched% ((FULL+PARTIAL)/Total) and Full% (FULL/Total).
 
+Pass attribution uses LLVM's PassRegistry.def as the source of truth: each
+source file is mapped to the pass class whose symbols it implements. Helper
+files (no pass class symbol) inherit the pass attribution of their directory
+when that directory contains files for exactly one pass class.
+
 The O2 pipeline set is extracted at startup from
 deps/llvm-project/llvm/lib/Passes/PassBuilderPipelines.cpp. If parsing
 fails, a hardcoded fallback list is used.
@@ -14,6 +19,7 @@ fails, a hardcoded fallback list is used.
 import argparse
 import re
 import sys
+from collections import Counter
 from glob import glob
 from pathlib import Path
 
@@ -21,13 +27,7 @@ MIN_TOTAL = 5
 MIN_NAME_LEN = 3
 
 STATUS_LINE_RE = re.compile(r'^(FULL|PARTIAL|NONE): (.*)$')
-PATH_TAIL_RE   = re.compile(r' (/[^ ]+:\d+:\d+)$')
-
-SIG_PASS_RUN_RE  = re.compile(r'([A-Z][A-Za-z0-9_]*)Pass::run')
-SIG_IMPL_RUN_RE  = re.compile(r'([A-Z][A-Za-z0-9_]*)Impl::run')
-SIG_LLVM_PASS_RE = re.compile(r'llvm::([A-Z][A-Za-z0-9_]*)Pass::')
-PATH_DIR_RE      = re.compile(r'lib/Transforms/([A-Za-z0-9_]+)/')
-PATH_FILE_RE     = re.compile(r'lib/Transforms/[A-Za-z0-9_]+/([A-Za-z0-9_]+)\.(?:cpp|h)')
+PATH_RE        = re.compile(r' (/\S+?):(\d+)(?::\d+)?$')
 
 STATUS_IDX = {'FULL': 0, 'PARTIAL': 1, 'NONE': 2}
 
@@ -189,6 +189,112 @@ def extract_o2_pipeline(repo_root: Path) -> tuple[set[str], str]:
 
 
 # ---------------------------------------------------------------------------
+# PassRegistry.def parsing — source of truth for pass class names
+# ---------------------------------------------------------------------------
+
+PASS_REGISTRY_DEF = 'deps/llvm-project/llvm/lib/Passes/PassRegistry.def'
+
+# Matches lines like:
+#   MODULE_PASS("globalopt", GlobalOptPass())
+#   FUNCTION_ANALYSIS("target-ir", TargetIRAnalysis())
+#   FUNCTION_PASS_WITH_PARAMS("instcombine", "InstCombinePass", ...)
+# Whitespace around args may include newlines (some entries span lines).
+PASS_REGISTRY_RE = re.compile(
+    r'^\s*(?:MODULE|FUNCTION|CGSCC|LOOP|LOOPNEST)_'
+    r'(?:ALIAS_)?'
+    r'(?:PASS|ANALYSIS)'
+    r'(?:_WITH_PARAMS)?'
+    r'\s*\(\s*"[^"]+"\s*,\s*"?'
+    r'([A-Z][A-Za-z0-9_]*)',
+    re.MULTILINE,
+)
+
+
+def parse_pass_registry(repo_root: Path) -> tuple[dict[str, str], str]:
+    """Parse PassRegistry.def. Returns (class_to_base, source_description).
+
+    class_to_base maps a C++ class name as it appears in symbols (e.g.
+    'SLPVectorizerPass', 'NoinlineNonPrevailing') to a display base name with
+    the Pass/Analysis suffix stripped (e.g. 'SLPVectorizer').
+    """
+    path = repo_root / PASS_REGISTRY_DEF
+    if not path.is_file():
+        return {}, f'not found: {path}'
+    try:
+        src = path.read_text(errors='replace')
+    except OSError as e:
+        return {}, f'read error: {e}'
+    class_to_base: dict[str, str] = {}
+    for m in PASS_REGISTRY_RE.finditer(src):
+        cls = m.group(1)
+        if cls.endswith('Pass') and len(cls) > 4:
+            base = cls[:-4]
+        elif cls.endswith('Analysis') and len(cls) > 8:
+            base = cls[:-8]
+        else:
+            base = cls
+        class_to_base[cls] = base
+    return class_to_base, f'parsed {len(class_to_base)} class entries'
+
+
+def build_symbol_class_re(class_to_base: dict[str, str]) -> re.Pattern | None:
+    if not class_to_base:
+        return None
+    # Sort longest-first so alternation prefers the longest matching name.
+    names = sorted(class_to_base.keys(), key=len, reverse=True)
+    pattern = r'\bllvm::(' + '|'.join(re.escape(n) for n in names) + r')::'
+    return re.compile(pattern)
+
+
+def extract_method_owner_classes(
+    symbol: str,
+    class_to_base: dict[str, str],
+    symbol_class_re: re.Pattern,
+) -> list[str]:
+    """Extract pass classes whose method this symbol IS — not classes that
+    merely appear as template args or return types.
+
+    A coverage symbol looks like `<return_type> <qualified_name>(<args>)`. We
+    want the class chain of the function being defined, e.g. for
+    `bool llvm::function_ref<...llvm::SLPVectorizerPass::run...>::callback_fn(...)`
+    the owner is `function_ref`, not `SLPVectorizerPass`.
+
+    Strategy: trim at the first '(' at angle-bracket depth 0 (drop args),
+    keep only depth-0 characters (drop everything inside <>), then take the
+    last whitespace-separated token — that's `qualified_name` of the
+    function. Match registered class names within just that token.
+    """
+    depth = 0
+    cut = len(symbol)
+    for i, c in enumerate(symbol):
+        if c == '<':
+            depth += 1
+        elif c == '>':
+            if depth > 0:
+                depth -= 1
+        elif c == '(' and depth == 0:
+            cut = i
+            break
+    head = symbol[:cut]
+
+    parts: list[str] = []
+    depth = 0
+    for c in head:
+        if c == '<':
+            depth += 1
+        elif c == '>':
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            parts.append(c)
+    qualified = ''.join(parts).split()
+    if not qualified:
+        return []
+    last = qualified[-1]
+    return [class_to_base[m.group(1)] for m in symbol_class_re.finditer(last)]
+
+
+# ---------------------------------------------------------------------------
 # Bucket classification
 # ---------------------------------------------------------------------------
 
@@ -319,17 +425,23 @@ def find_report(arg):
     return None
 
 
-def scan_report(report_path: str) -> tuple[dict, int, int, int]:
-    counters: dict[str, list[int]] = {}
+def scan_report(
+    report_path: str,
+    symbol_class_re: re.Pattern | None,
+    class_to_base: dict[str, str],
+) -> tuple[dict, dict, int, int, int]:
+    """Scan the coverage report.
+
+    Returns (file_counters, file_class_hits, full, partial, none).
+      - file_counters: file_path -> [F, P, N]
+      - file_class_hits: file_path -> Counter({base_name: count})
+    """
+    file_counters: dict[str, list[int]] = {}
+    file_class_hits: dict[str, Counter] = {}
     full_total = partial_total = none_total = 0
 
-    sig_pass_run  = SIG_PASS_RUN_RE.findall
-    sig_impl_run  = SIG_IMPL_RUN_RE.findall
-    sig_llvm_pass = SIG_LLVM_PASS_RE.findall
-    path_dir      = PATH_DIR_RE.findall
-    path_file     = PATH_FILE_RE.findall
-    status_match  = STATUS_LINE_RE.match
-    path_search   = PATH_TAIL_RE.search
+    status_match = STATUS_LINE_RE.match
+    path_search  = PATH_RE.search
 
     with open(report_path, 'r', errors='replace') as f:
         for raw in f:
@@ -339,14 +451,6 @@ def scan_report(report_path: str) -> tuple[dict, int, int, int]:
             status = m.group(1)
             rest = m.group(2)
 
-            pm = path_search(rest)
-            if pm:
-                sig = rest[:pm.start()]
-                path = pm.group(1)
-            else:
-                sig = rest
-                path = ''
-
             if status == 'FULL':
                 full_total += 1
             elif status == 'PARTIAL':
@@ -354,37 +458,77 @@ def scan_report(report_path: str) -> tuple[dict, int, int, int]:
             else:
                 none_total += 1
 
-            line_passes: set[str] = set()
-            for name in sig_pass_run(sig):
-                if len(name) >= MIN_NAME_LEN:
-                    line_passes.add(name)
-            for name in sig_impl_run(sig):
-                if name.endswith('Pass'):
-                    name = name[:-4]
-                if len(name) >= MIN_NAME_LEN:
-                    line_passes.add(name)
-            for name in sig_llvm_pass(sig):
-                if len(name) >= MIN_NAME_LEN:
-                    line_passes.add(name)
-            if path:
-                for name in path_dir(path):
-                    if len(name) >= MIN_NAME_LEN:
-                        line_passes.add(name)
-                for name in path_file(path):
-                    if len(name) >= MIN_NAME_LEN:
-                        line_passes.add(name)
-
-            if not line_passes:
+            pm = path_search(rest)
+            if not pm:
                 continue
-            idx = STATUS_IDX[status]
-            for p in line_passes:
-                ctr = counters.get(p)
-                if ctr is None:
-                    ctr = [0, 0, 0]
-                    counters[p] = ctr
-                ctr[idx] += 1
+            file_path = pm.group(1)
 
-    return counters, full_total, partial_total, none_total
+            ctr = file_counters.get(file_path)
+            if ctr is None:
+                ctr = [0, 0, 0]
+                file_counters[file_path] = ctr
+            ctr[STATUS_IDX[status]] += 1
+
+            if symbol_class_re is None:
+                continue
+            symbol = rest[:pm.start()]
+            for base in extract_method_owner_classes(
+                symbol, class_to_base, symbol_class_re
+            ):
+                hits = file_class_hits.get(file_path)
+                if hits is None:
+                    hits = Counter()
+                    file_class_hits[file_path] = hits
+                hits[base] += 1
+
+    return file_counters, file_class_hits, full_total, partial_total, none_total
+
+
+def aggregate_by_pass(
+    file_counters: dict[str, list[int]],
+    file_class_hits: dict[str, Counter],
+) -> dict[str, list[int]]:
+    """Roll up per-file counters into per-pass counters.
+
+    Attribution priority:
+      1. Direct: file has a registered pass class symbol -> dominant class.
+      2. Directory: file has no class symbols, but every classified file in
+         the same directory maps to a single pass class -> inherit it.
+         (Matches the InstCombine/ shape; rejects mixed dirs like Scalar/.)
+      3. Fallback: filename basename (legacy behavior).
+    """
+    file_to_pass: dict[str, str] = {}
+    dir_classes: dict[str, set[str]] = {}
+
+    for fp, hits in file_class_hits.items():
+        if not hits:
+            continue
+        base, _ = hits.most_common(1)[0]
+        file_to_pass[fp] = base
+        d = str(Path(fp).parent)
+        dir_classes.setdefault(d, set()).add(base)
+
+    counters: dict[str, list[int]] = {}
+    for fp, ctr in file_counters.items():
+        name = file_to_pass.get(fp)
+        if name is None:
+            d = str(Path(fp).parent)
+            classes = dir_classes.get(d)
+            if classes and len(classes) == 1:
+                name = next(iter(classes))
+            else:
+                stem = Path(fp).stem
+                if len(stem) < MIN_NAME_LEN:
+                    continue
+                name = stem
+        c = counters.get(name)
+        if c is None:
+            c = [0, 0, 0]
+            counters[name] = c
+        c[0] += ctr[0]
+        c[1] += ctr[1]
+        c[2] += ctr[2]
+    return counters
 
 
 # ---------------------------------------------------------------------------
@@ -442,13 +586,20 @@ def main():
     o2_set, o2_source = extract_o2_pipeline(repo_root)
     print(f"O2 pipeline: {len(o2_set)} passes ({o2_source})")
 
+    class_to_base, registry_source = parse_pass_registry(repo_root)
+    print(f"Pass registry: {registry_source}")
+    symbol_class_re = build_symbol_class_re(class_to_base)
+
     report = find_report(args.report)
     if not report or not Path(report).is_file():
         sys.stderr.write(f"Usage: {sys.argv[0]} [coverage-report]\n")
         sys.stderr.write("No coverage report found under build/workdir_*/\n")
         return 1
 
-    counters, full_total, partial_total, none_total = scan_report(report)
+    file_counters, file_class_hits, full_total, partial_total, none_total = (
+        scan_report(report, symbol_class_re, class_to_base)
+    )
+    counters = aggregate_by_pass(file_counters, file_class_hits)
 
     # Build per-pass rows: (name, F, P, N, Total, Touched%, Full%)
     rows_by_bucket: dict[str, list[tuple]] = {b: [] for b in BUCKETS_ORDER}
