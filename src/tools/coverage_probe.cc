@@ -45,6 +45,7 @@
 #include <set>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 // ----------------------------------------------------------------------
@@ -67,19 +68,82 @@ __sanitizer_cov_8bit_counters_init(uint8_t *, uint8_t *) {}
 extern "C" __attribute__((no_sanitize("coverage"))) void
 __sanitizer_cov_pcs_init(const uintptr_t *, const uintptr_t *) {}
 
-extern "C" void __sanitizer_cov_trace_cmp1(uint8_t, uint8_t) {}
-extern "C" void __sanitizer_cov_trace_cmp2(uint16_t, uint16_t) {}
-extern "C" void __sanitizer_cov_trace_cmp4(uint32_t, uint32_t) {}
-extern "C" void __sanitizer_cov_trace_cmp8(uint64_t, uint64_t) {}
-extern "C" void __sanitizer_cov_trace_const_cmp1(uint8_t, uint8_t) {}
-extern "C" void __sanitizer_cov_trace_const_cmp2(uint16_t, uint16_t) {}
-extern "C" void __sanitizer_cov_trace_const_cmp4(uint32_t, uint32_t) {}
-extern "C" void __sanitizer_cov_trace_const_cmp8(uint64_t, uint64_t) {}
-extern "C" void __sanitizer_cov_trace_switch(uint64_t, uint64_t *) {}
-extern "C" void __sanitizer_cov_trace_div4(uint32_t) {}
-extern "C" void __sanitizer_cov_trace_div8(uint64_t) {}
-extern "C" void __sanitizer_cov_trace_gep(uintptr_t) {}
-extern "C" void __sanitizer_cov_trace_pc_indir(uintptr_t) {}
+// ----------------------------------------------------------------------
+// Ordered PC trace.
+//
+// The sancov build flags include trace-cmp but NOT trace-pc-guard, so we
+// have no per-BB runtime callback. Instead we repurpose the trace-cmp /
+// trace-switch / trace-div / trace-gep / trace-pc-indir hooks: each fires
+// at its corresponding instruction, and __builtin_return_address(0) gives
+// the caller's PC inside the LLVM library. Symbolizing that PC yields the
+// enclosing function name. SLPVectorizer is comparison-heavy so this
+// gives a dense (but cmp-biased) function transition trace.
+//
+// Buffer is fixed-size to keep the hot path branch-light and avoid
+// allocation noise. On overflow we set a flag and stop appending; the
+// partial trace is still useful for chain extraction.
+// ----------------------------------------------------------------------
+
+namespace {
+// Default cap: 5M PCs * 8B = 40MB. The full O2 pipeline emits hundreds of
+// thousands of cmp/switch/div/gep events even on tiny inputs (PassManager
+// + DenseMap lookups dominate the early trace), so we need substantial
+// headroom. Override via REGATONI_TRACE_CAP if the default isn't enough.
+constexpr size_t kDefaultTraceCapacity = 5'000'000;
+struct TraceState {
+  uintptr_t *buf;       // heap-allocated, never freed (process exits soon)
+  size_t cap;
+  size_t n;
+  bool overflow;
+  bool enabled;
+};
+}  // namespace
+
+static TraceState g_trace = {nullptr, 0, 0, false, false};
+
+extern "C" __attribute__((no_sanitize("coverage"))) void
+record_trace_pc(uintptr_t pc) {
+  if (!g_trace.enabled) return;
+  // Cheap consecutive-PC dedup: many cmp PCs repeat on tight loops.
+  if (g_trace.n > 0 && g_trace.buf[g_trace.n - 1] == pc) return;
+  if (g_trace.n >= g_trace.cap) {
+    g_trace.overflow = true;
+    return;
+  }
+  g_trace.buf[g_trace.n++] = pc;
+}
+
+#define TRACE_HOOK_BODY()                                                      \
+  record_trace_pc(reinterpret_cast<uintptr_t>(__builtin_return_address(0)))
+
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_cmp1(uint8_t, uint8_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_cmp2(uint16_t, uint16_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_cmp4(uint32_t, uint32_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_cmp8(uint64_t, uint64_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_const_cmp1(uint8_t, uint8_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_const_cmp2(uint16_t, uint16_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_const_cmp4(uint32_t, uint32_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_const_cmp8(uint64_t, uint64_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_switch(uint64_t, uint64_t *) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_div4(uint32_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_div8(uint64_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_gep(uintptr_t) { TRACE_HOOK_BODY(); }
+extern "C" __attribute__((no_sanitize("coverage"))) void
+__sanitizer_cov_trace_pc_indir(uintptr_t) { TRACE_HOOK_BODY(); }
+
+#undef TRACE_HOOK_BODY
 
 // ----------------------------------------------------------------------
 // Coverage harvesting.
@@ -235,20 +299,41 @@ std::vector<std::string> symbolize(const std::vector<uintptr_t> &pcs,
 // CLI.
 // ----------------------------------------------------------------------
 
+enum class OutputMode {
+  ReachedSet,     // default: unique function names hit (existing behavior)
+  CallChains,     // unique k-chains from ordered transition sequence
+  CallSequence,   // dedup'd function transition sequence, one fn per line
+};
+
 struct ProbeOptions {
   std::string input_path;
   std::string filter;  // empty = no filter
+  OutputMode mode = OutputMode::ReachedSet;
+  size_t k = 3;        // chain length for --call-chains
 };
 
 [[noreturn]] void usage(int code) {
   std::fprintf(
       stderr,
       "Usage: coverage_probe <input.ll> [--filter=<substring>]\n"
+      "                                 [--call-chains | --call-sequence]\n"
+      "                                 [--k=<N>]\n"
       "\n"
-      "  Runs the O2 pipeline on the input IR file and prints the unique\n"
-      "  function names of every basic block reached during the run.\n"
-      "  --filter=<sub> restricts output to function names containing the\n"
-      "  given substring (e.g. --filter=SLPVectorizer).\n"
+      "  Default: prints unique function names reached during the O2\n"
+      "  pipeline (set form, deduped). With --call-chains or\n"
+      "  --call-sequence, captures an ordered PC trace via the sancov\n"
+      "  trace-cmp/switch/div/gep/pc_indir hooks and reports either:\n"
+      "    --call-chains    unique sliding-window chains of length k\n"
+      "                     (default k=3), one chain per line as\n"
+      "                     'fn1 -> fn2 -> fn3'\n"
+      "    --call-sequence  the dedup'd function transition sequence,\n"
+      "                     one fn per line\n"
+      "  --k=<N>            chain length (default 3, only with --call-chains)\n"
+      "  --filter=<sub>     restrict to function names containing the\n"
+      "                     substring (applied before chain extraction)\n"
+      "\n"
+      "  Trace buffer is capped at 100K PCs; on overflow a warning is\n"
+      "  printed to stderr and the partial trace is used.\n"
       "\n"
       "  llvm-symbolizer is invoked from $LLVM_SYMBOLIZER_PATH (or PATH).\n"
       "\n"
@@ -258,12 +343,28 @@ struct ProbeOptions {
 
 ProbeOptions parseArgs(int argc, char **argv) {
   ProbeOptions opts;
+  bool sawCallChains = false;
+  bool sawCallSequence = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "-h" || a == "--help") usage(2);
     static const char kFilter[] = "--filter=";
+    static const char kK[] = "--k=";
     if (a.rfind(kFilter, 0) == 0) {
       opts.filter = a.substr(sizeof(kFilter) - 1);
+      continue;
+    }
+    if (a == "--call-chains") {
+      sawCallChains = true;
+      continue;
+    }
+    if (a == "--call-sequence") {
+      sawCallSequence = true;
+      continue;
+    }
+    if (a.rfind(kK, 0) == 0) {
+      opts.k = static_cast<size_t>(
+          std::strtoul(a.substr(sizeof(kK) - 1).c_str(), nullptr, 10));
       continue;
     }
     if (!a.empty() && a[0] == '-') {
@@ -279,6 +380,18 @@ ProbeOptions parseArgs(int argc, char **argv) {
     opts.input_path = a;
   }
   if (opts.input_path.empty()) usage(2);
+  if (sawCallChains && sawCallSequence) {
+    std::fprintf(stderr,
+                 "coverage_probe: --call-chains and --call-sequence are "
+                 "mutually exclusive\n");
+    usage(2);
+  }
+  if (sawCallChains) opts.mode = OutputMode::CallChains;
+  else if (sawCallSequence) opts.mode = OutputMode::CallSequence;
+  if (opts.k < 1) {
+    std::fprintf(stderr, "coverage_probe: --k must be >= 1\n");
+    usage(2);
+  }
   return opts;
 }
 
@@ -304,6 +417,20 @@ buildTM(const llvm::Triple &T) {
 
 int main(int argc, char **argv) {
   ProbeOptions opts = parseArgs(argc, argv);
+
+  // Allocate ordered-PC trace buffer once (chain modes only need it, but
+  // it's cheap to allocate even if unused — heap pages stay reserved
+  // unless the trace hooks actually write to them).
+  {
+    size_t cap = kDefaultTraceCapacity;
+    if (const char *env = std::getenv("REGATONI_TRACE_CAP")) {
+      char *end = nullptr;
+      unsigned long v = std::strtoul(env, &end, 10);
+      if (end && *end == 0 && v > 0) cap = static_cast<size_t>(v);
+    }
+    g_trace.buf = new uintptr_t[cap];
+    g_trace.cap = cap;
+  }
 
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
@@ -345,11 +472,14 @@ int main(int argc, char **argv) {
   llvm::ModulePassManager MPM =
       PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
 
-  // Isolate pipeline coverage: zero counters now, then harvest.
+  // Isolate pipeline coverage: zero counters and trace, run, harvest.
   resetCounters();
+  g_trace.n = 0;
+  g_trace.overflow = false;
+  g_trace.enabled = (opts.mode != OutputMode::ReachedSet);
   MPM.run(*M, MAM);
+  g_trace.enabled = false;
 
-  std::vector<uintptr_t> pcs = harvestPCs();
   std::string self = selfPath();
   if (self.empty()) {
     std::fprintf(stderr,
@@ -357,22 +487,81 @@ int main(int argc, char **argv) {
                  "(/proc/self/exe)\n");
     return 1;
   }
-
-  // Translate runtime PCs to in-file static VAs for --obj symbolization.
   uintptr_t base = selfLoadBase(self);
+
+  // -------- Default mode: counter-derived reached set (unchanged) --------
+  if (opts.mode == OutputMode::ReachedSet) {
+    std::vector<uintptr_t> pcs = harvestPCs();
+    if (base != 0) {
+      for (uintptr_t &pc : pcs) pc -= base;
+    }
+    std::vector<std::string> names = symbolize(pcs, self);
+    std::set<std::string> uniq;
+    for (const std::string &n : names) {
+      if (n.empty()) continue;
+      if (!opts.filter.empty() && n.find(opts.filter) == std::string::npos)
+        continue;
+      uniq.insert(n);
+    }
+    for (const std::string &n : uniq) std::printf("%s\n", n.c_str());
+    return 0;
+  }
+
+  // -------- Chain / sequence mode: ordered trace from trace-cmp hooks ----
+  if (g_trace.overflow) {
+    std::fprintf(stderr,
+                 "coverage_probe: warning: trace buffer overflowed at %zu "
+                 "PCs (cap=%zu); using partial trace. Override with "
+                 "REGATONI_TRACE_CAP=<n>.\n",
+                 g_trace.n, g_trace.cap);
+  }
+
+  // Symbolize unique PCs only (the trace has heavy repetition even after
+  // consecutive-PC dedup, so unique-set is much smaller than n).
+  std::vector<uintptr_t> traceVA(g_trace.buf, g_trace.buf + g_trace.n);
   if (base != 0) {
-    for (uintptr_t &pc : pcs) pc -= base;
+    for (uintptr_t &pc : traceVA) pc -= base;
+  }
+  std::vector<uintptr_t> uniquePCs(traceVA.begin(), traceVA.end());
+  std::sort(uniquePCs.begin(), uniquePCs.end());
+  uniquePCs.erase(std::unique(uniquePCs.begin(), uniquePCs.end()),
+                  uniquePCs.end());
+  std::vector<std::string> uniqueNames = symbolize(uniquePCs, self);
+  std::unordered_map<uintptr_t, std::string> pcToName;
+  pcToName.reserve(uniquePCs.size() * 2);
+  for (size_t i = 0; i < uniquePCs.size(); ++i) {
+    pcToName.emplace(uniquePCs[i], uniqueNames[i]);
   }
 
-  std::vector<std::string> names = symbolize(pcs, self);
-
-  std::set<std::string> uniq;
-  for (const std::string &n : names) {
-    if (n.empty()) continue;
-    if (!opts.filter.empty() && n.find(opts.filter) == std::string::npos)
+  // Build function transition sequence with consecutive-name dedup.
+  std::vector<std::string> fnSeq;
+  fnSeq.reserve(traceVA.size() / 32 + 16);
+  for (uintptr_t pc : traceVA) {
+    auto it = pcToName.find(pc);
+    if (it == pcToName.end() || it->second.empty()) continue;
+    const std::string &nm = it->second;
+    if (!opts.filter.empty() && nm.find(opts.filter) == std::string::npos)
       continue;
-    uniq.insert(n);
+    if (!fnSeq.empty() && fnSeq.back() == nm) continue;
+    fnSeq.push_back(nm);
   }
-  for (const std::string &n : uniq) std::printf("%s\n", n.c_str());
+
+  if (opts.mode == OutputMode::CallSequence) {
+    for (const std::string &n : fnSeq) std::printf("%s\n", n.c_str());
+    return 0;
+  }
+
+  // CallChains: emit unique sliding windows of length k.
+  if (fnSeq.size() < opts.k) return 0;
+  std::set<std::string> chains;
+  for (size_t i = 0; i + opts.k <= fnSeq.size(); ++i) {
+    std::string chain;
+    for (size_t j = 0; j < opts.k; ++j) {
+      if (j) chain += " -> ";
+      chain += fnSeq[i + j];
+    }
+    chains.insert(std::move(chain));
+  }
+  for (const std::string &c : chains) std::printf("%s\n", c.c_str());
   return 0;
 }

@@ -6,6 +6,9 @@
 #   ./pass_probe.sh --pass=<filter> --list-reached <input.ll>
 #   ./pass_probe.sh --pass=<filter> --check=<func>      <input.ll>
 #   ./pass_probe.sh --pass=<filter> --diff <a.ll> <b.ll>
+#   ./pass_probe.sh --pass=<filter> --call-chains [--k=<N>] <input.ll>
+#   ./pass_probe.sh --pass=<filter> --call-sequence       <input.ll>
+#   ./pass_probe.sh --pass=<filter> --chain-diff [--k=<N>] <a.ll> <b.ll>
 #
 #   --pass=<filter>  substring used as the coverage_probe --filter (e.g.
 #                    slp-vectorizer maps to SLPVectorizer; if the filter
@@ -16,8 +19,18 @@
 #                    function name, exit 1 otherwise; no stdout
 #   --diff a b       print "+ name" for names only-in-b, "- name" for
 #                    names only-in-a, sorted
-#   --raw            skip the post-processing simplifier and emit the full
-#                    demangled symbols straight from llvm-symbolizer
+#   --call-chains    print every unique sliding-window call chain of
+#                    length k from the dynamic function transition
+#                    sequence; each chain printed as "a -> b -> c"
+#   --call-sequence  print the dedup'd function transition sequence,
+#                    one fn per line (in execution order)
+#   --chain-diff a b print "+ chain" for chains only-in-b, "- chain"
+#                    for chains only-in-a
+#   --k=<N>          chain length (default 3, only meaningful for
+#                    --call-chains / --chain-diff)
+#   --raw            skip the post-processing simplifier and emit the
+#                    full demangled symbols straight from llvm-symbolizer
+#   --chain-format=<raw|simplified>   alias for --raw / default
 
 set -euo pipefail
 
@@ -56,27 +69,35 @@ normalise_pass() {
 }
 
 usage() {
-    sed -n '3,21p' "$0" | sed 's/^# \?//'
+    sed -n '3,32p' "$0" | sed 's/^# \?//'
     exit "${1:-2}"
 }
 
 PASS=""
-MODE=""        # list | check | diff
+MODE=""        # list | check | diff | call-chains | call-sequence | chain-diff
 CHECK_FN=""
 RAW=0
+K=3
 INPUTS=()
 
 while (($#)); do
     case "$1" in
-        --pass=*)        PASS="${1#--pass=}";       shift ;;
-        --list-reached)  MODE="list";               shift ;;
-        --check=*)       MODE="check"; CHECK_FN="${1#--check=}"; shift ;;
-        --diff)          MODE="diff";               shift ;;
-        --raw)           RAW=1;                     shift ;;
-        -h|--help)       usage 0 ;;
-        --)              shift; INPUTS+=("$@");     break ;;
-        -*)              echo "unknown flag: $1" >&2; usage 2 ;;
-        *)               INPUTS+=("$1");            shift ;;
+        --pass=*)         PASS="${1#--pass=}";       shift ;;
+        --list-reached)   MODE="list";               shift ;;
+        --check=*)        MODE="check"; CHECK_FN="${1#--check=}"; shift ;;
+        --diff)           MODE="diff";               shift ;;
+        --call-chains)    MODE="call-chains";        shift ;;
+        --call-sequence)  MODE="call-sequence";      shift ;;
+        --chain-diff)     MODE="chain-diff";         shift ;;
+        --k=*)            K="${1#--k=}";             shift ;;
+        --raw)            RAW=1;                     shift ;;
+        --chain-format=raw)        RAW=1;            shift ;;
+        --chain-format=simplified) RAW=0;            shift ;;
+        --chain-format=*) echo "unknown --chain-format: $1" >&2; usage 2 ;;
+        -h|--help)        usage 0 ;;
+        --)               shift; INPUTS+=("$@");     break ;;
+        -*)               echo "unknown flag: $1" >&2; usage 2 ;;
+        *)                INPUTS+=("$1");            shift ;;
     esac
 done
 
@@ -105,8 +126,10 @@ FILTER="$(normalise_pass "$PASS")"
 #      recovered from the template args, else just "std::<short_name>".
 #   7. Deduplicate (keeps the first occurrence).
 #
-# Generic enough for any pass: only the namespace strippers
-# ("llvm::" + lowercase-namespace chains) are LLVM-specific.
+# When CHAIN_DELIM is set in the environment, each input line is split
+# on the delimiter, every piece is simplified, and the pieces are
+# rejoined with the same delimiter — so "a -> b -> c" stays a chain
+# but each leg is normalised. Dedup is by the simplified chain.
 # ------------------------------------------------------------------
 simplify_stream() {
 # Run the inline Python via process substitution so the heredoc supplies
@@ -114,6 +137,7 @@ simplify_stream() {
 # would route the heredoc into stdin and the symbolizer output would be
 # silently dropped.)
 python3 <(cat <<'PY'
+import os
 import re
 import sys
 
@@ -241,26 +265,60 @@ def simplify(line):
     return s or None
 
 
+CHAIN_DELIM = os.environ.get('CHAIN_DELIM', '')
+NO_DEDUP = os.environ.get('NO_DEDUP', '') == '1'
+
+
+def simplify_chain(line):
+    parts = line.split(CHAIN_DELIM)
+    pieces = []
+    for p in parts:
+        s = simplify(p)
+        if s is None:
+            return None
+        pieces.append(s)
+    return CHAIN_DELIM.join(pieces)
+
+
 seen = set()
 for raw in sys.stdin:
-    out = simplify(raw)
-    if out is None or out in seen:
+    raw = raw.rstrip('\n')
+    if CHAIN_DELIM and CHAIN_DELIM in raw:
+        out = simplify_chain(raw)
+    else:
+        out = simplify(raw)
+    if out is None:
         continue
-    seen.add(out)
+    if not NO_DEDUP:
+        if out in seen:
+            continue
+        seen.add(out)
     print(out)
 PY
 )
 }
 
+# probe_raw <args...> — passes positional args through to coverage_probe.
+# The first positional after the flags is the input file.
 probe_raw() {
-    "$PROBE_BIN" "$1" "--filter=$FILTER"
+    "$PROBE_BIN" "$@" "--filter=$FILTER"
 }
 
 probe() {
     if (( RAW )); then
-        probe_raw "$1"
+        probe_raw "$@"
     else
-        probe_raw "$1" | simplify_stream
+        probe_raw "$@" | simplify_stream
+    fi
+}
+
+# Chain-aware probe: simplifier needs to split on " -> " before
+# normalising each leg.
+probe_chain() {
+    if (( RAW )); then
+        probe_raw "$@"
+    else
+        CHAIN_DELIM=" -> " probe_raw "$@" | CHAIN_DELIM=" -> " simplify_stream
     fi
 }
 
@@ -295,6 +353,40 @@ case "$MODE" in
         probe "${INPUTS[1]}" | sort -u > "$b_tmp"
         # only-in-a (deletions) → "- name"; only-in-b (additions) → "+ name"
         # interleaved so consumers see both directions.
+        comm -23 "$a_tmp" "$b_tmp" | sed 's/^/- /'
+        comm -13 "$a_tmp" "$b_tmp" | sed 's/^/+ /'
+        ;;
+    call-chains)
+        if (( ${#INPUTS[@]} != 1 )); then
+            echo "ERROR: --call-chains needs exactly one input file" >&2; exit 2
+        fi
+        probe_chain --call-chains "--k=$K" "${INPUTS[0]}"
+        ;;
+    call-sequence)
+        if (( ${#INPUTS[@]} != 1 )); then
+            echo "ERROR: --call-sequence needs exactly one input file" >&2; exit 2
+        fi
+        # Sequence is order-sensitive — never globally dedup. coverage_probe
+        # already collapses consecutive repeats; simplification can produce
+        # new adjacent dupes (e.g. two distinct demangled symbols mapping to
+        # the same simplified name), which we collapse here without touching
+        # non-adjacent repeats.
+        if (( RAW )); then
+            probe_raw --call-sequence "${INPUTS[0]}"
+        else
+            probe_raw --call-sequence "${INPUTS[0]}" \
+                | NO_DEDUP=1 simplify_stream \
+                | awk 'NR==1 || $0 != prev { print } { prev = $0 }'
+        fi
+        ;;
+    chain-diff)
+        if (( ${#INPUTS[@]} != 2 )); then
+            echo "ERROR: --chain-diff needs exactly two input files" >&2; exit 2
+        fi
+        a_tmp="$(mktemp)"; b_tmp="$(mktemp)"
+        trap 'rm -f "$a_tmp" "$b_tmp"' EXIT
+        probe_chain --call-chains "--k=$K" "${INPUTS[0]}" | sort -u > "$a_tmp"
+        probe_chain --call-chains "--k=$K" "${INPUTS[1]}" | sort -u > "$b_tmp"
         comm -23 "$a_tmp" "$b_tmp" | sed 's/^/- /'
         comm -13 "$a_tmp" "$b_tmp" | sed 's/^/+ /'
         ;;
