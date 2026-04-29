@@ -1,0 +1,55 @@
+define <16 x double> @test(ptr %x, double %v, double %a) {
+;
+  %gep1 = getelementptr inbounds double, ptr %x, i64 1
+  %gep2 = getelementptr inbounds double, ptr %x, i64 2
+  %gep3 = getelementptr inbounds double, ptr %x, i64 3
+  %gep4 = getelementptr inbounds double, ptr %x, i64 4
+  %gep5 = getelementptr inbounds double, ptr %x, i64 5
+  %gep6 = getelementptr inbounds double, ptr %x, i64 8
+  %gep7 = getelementptr inbounds double, ptr %x, i64 9
+  %gep8 = getelementptr inbounds double, ptr %x, i64 9
+  %gep9 = getelementptr inbounds double, ptr %x, i64 10
+  %x0 = load double, ptr %x, align 4
+  %x1 = load double, ptr %gep1, align 4
+  %x2 = load double, ptr %gep2, align 4
+  %x3 = load double, ptr %gep3, align 4
+  %x4 = load double, ptr %gep4, align 4
+  %x5 = load double, ptr %gep5, align 4
+  %x6 = load double, ptr %gep6, align 4
+  %x7 = load double, ptr %gep7, align 4
+  %x8 = load double, ptr %gep8, align 4
+  %x9 = load double, ptr %gep9, align 4
+  %add1 = fadd double %a, %x0
+  %add2 = fadd double %a, %x1
+  %add3 = fadd double %a, %x2
+  %add4 = fadd double %a, %x3
+  %add5 = fadd double %a, %x4
+  %add6 = fadd double %a, %x5
+  %add7 = fadd double %a, %x6
+  %add8 = fadd double %a, %x7
+  %add9 = fadd double %a, %x8
+  %add10 = fadd double %a, %x9
+  %add11 = fadd double %a, %v
+  %add12 = fadd double %a, %v
+  %add13 = fadd double %a, %v
+  %add14 = fadd double %a, %v
+  %add15 = fadd double %a, %v
+  %add16 = fadd double %a, %v
+  %i0 = insertelement <16 x double> poison, double %add1, i32 0
+  %i1 = insertelement <16 x double> %i0, double %add2, i32 1
+  %i2 = insertelement <16 x double> %i1, double %add3, i32 2
+  %i3 = insertelement <16 x double> %i2, double %add4, i32 3
+  %i4 = insertelement <16 x double> %i3, double %add5, i32 4
+  %i5 = insertelement <16 x double> %i4, double %add6, i32 5
+  %i6 = insertelement <16 x double> %i5, double %add7, i32 6
+  %i7 = insertelement <16 x double> %i6, double %add8, i32 7
+  %i8 = insertelement <16 x double> %i7, double %add9, i32 8
+  %i9 = insertelement <16 x double> %i8, double %add10, i32 9
+  %i10 = insertelement <16 x double> %i9, double %add11, i32 10
+  %i11 = insertelement <16 x double> %i10, double %add12, i32 11
+  %i12 = insertelement <16 x double> %i11, double %add13, i32 12
+  %i13 = insertelement <16 x double> %i12, double %add14, i32 13
+  %i14 = insertelement <16 x double> %i13, double %add15, i32 14
+  %i15 = insertelement <16 x double> %i14, double %add16, i32 15
+  ret <16 x double> %i15
+}

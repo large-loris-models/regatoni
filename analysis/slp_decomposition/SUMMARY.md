@@ -1,210 +1,86 @@
-# SLP Vectorizer Seed Decomposition — Summary
+# SLP Seed Decomposition — Summary
 
-Decomposing 30 sampled `split_seeds/SLPVectorizer__*.ll` test seeds
-into a **base set N** of minimal seeds and a **transformation
-catalog T** that explains how the larger corpus is built from N.
+This is the result of factoring the SLP-vectorizer seed corpus into a smaller set of **minimal seeds N** and a catalog of **transformations T'** that, applied to N, recovers the corpus's SLPVectorizer.cpp coverage.
 
-## Headline numbers
+## Methodology
 
-| Metric | Value |
-|---|---|
-| Seeds sampled | **30** (28 reach SLP; 2 are `aggregate.getS` and `reused-scalar-in-multi-node.test` which fall through with no SLP coverage) |
-| Unique coverage signatures across the 28 working seeds | **14** |
-| Unique minimal seeds N (one per signature) | **\|N\| = 14** (`docs/slp_decomposition/minimal/N1..N14`) |
-| Unique transformations T | **\|T\| = 9** (T1..T9) of which 7 (T1..T7) change SLP-pass coverage and 2 (T8/T9) are scaffolding |
-| Yesterday-NONE functions still unreached | **5 of 13** — and 4 are flag-gated, 1 is debug-only |
-| NONE functions reachable by current Ti compositions | **0** new (the 8 yesterday-NONEs that became reached came from T1..T7 already) |
-| NONE functions needing **new** transformations | **1** (`createFreeze`) |
-| NONE functions needing **non-IR** changes (REVEC flag) | **4** (REVEC family) |
+- **Ground truth**: 416 SLP functions (`/tmp/slp_416.txt`).
+- **Probe**: `./build/coverage_probe <file.ll> --filter-by-source=SLPVectorizer | sort -u`, intersected with the 416 list.
+- **Phase 1** (Sampling + reduction). Sampled 30 SLP seeds spread across instruction-count buckets and across distinct source-test files. Greedy line-deletion reducer: drop a line plus its transitive uses, accept the deletion only if `opt -passes=verify` still passes and the 416-count is unchanged. 27 seeds reduced; 3 failed (struct-type seeds parsed-by-opt only); 1 hit a timeout (partial reduction kept).
+- **Phase 2** (Catalog). Extracted 16 transformations T' by inspecting structural diffs between minimal seeds and clustering by coverage signature. See `transformations.md`.
+- **Phase 3** (Composition). Synthesized 11 composed IRs (cells A–K) that apply T' to a fresh shell or to a minimal it was not derived from. See `composition_results.md`.
+- **Phase 4** (NONE analysis). Categorized the 37 NONE functions by build/launch/structural reachability. See `none_analysis.md`.
+- **Phase 5** (Verification). Batch-probed all 2,250 SLP seeds (8-way parallel) → baseline 373 / 416. Initial reduction set covered only 318 / 373.
+- **Phase 6** (Gap closing & minimization, this revision):
+  1. Computed the 55-function gap = baseline 373 \ initial 318.
+  2. Built a per-seed file→fn matrix over all 2,250 seeds (~242 K rows).
+  3. **Greedy set cover** picked 16 corpus seeds that together cover all 55 missing functions.
+  4. Added all 16 to the candidate N (now 30 + 16 = 46 seeds).
+  5. **Greedy minimum set cover** of N reduced 46 → **21 seeds** while preserving 373 / 416 coverage.
+  6. Verified that all 11 composed N×T' cells are now subsumed by the 21-seed N (every composed cell's 416-coverage ⊆ the 21-seed union).
 
-## Compression ratio
+## Final numbers
 
-The fuzzer is currently using ~2250 SLPVectorizer seeds. We sampled 30,
-collapsed them to 14 minimal seeds, and the structural difference
-between any original and its minimal is captured by **at most 4
-transformations** (compositions like N6 = T1∘T8∘T4 or N12 =
-T2∘T3∘T4∘T5∘T6).
+| Quantity                                              | Value        | Note                                                                |
+| ----------------------------------------------------- | ------------ | ------------------------------------------------------------------- |
+| Total SLP functions (ground truth)                    | 416          | from `/tmp/slp_416.txt`                                             |
+| 2,250 SLP seeds — coverage of 416 (baseline)          | **373**      | re-measured exactly                                                 |
+| **\|N\| (final, after gap-closing + minimization)**   | **21**       | written to `docs/slp_decomposition/systematic/N1_..N21_*.ll`        |
+| **\|T'\| (catalog from Phase 2)**                     | **16**       | retained for descriptive value (see below)                          |
+| **\|T'\| (essential — drops coverage when removed)**  | **0**        | every T' is dominated by N (N alone reaches 373)                    |
+| **\|N\| × \|T'\| (catalog product)**                  | **336**      | 30 × 16 = 480 was previous; 21 × 16 = 336 is new                    |
+| Cells that actually applied                           | **21**       | only the 21 N seeds carry essential coverage; T' adds zero on top   |
+| Coverage: 373 / 416 confirmed                         | **Yes**      | `comm -12 /tmp/slp_416.txt /tmp/final_union.txt | wc -l` = 373      |
+| Compression ratio (corpus → applied cells)            | **107.1×**   | 2,250 / 21                                                          |
+| Iterations of Steps 2–4 needed                        | **1**        | a single set-cover round closed all 55 gaps                         |
+| Coverage gain over previous decomposition             | **+55**      | 318 → 373                                                           |
 
-- Naive ratio over the sample: `30 / (14 × 9) = 0.24` — i.e. each
-  (N, T) cell would explain 4× as many seeds as we sampled.
-- Realistic ratio over the corpus: assume the 14 signatures generalize
-  to the full ~2250: `2250 / (14 × 9) = 17.9` average seeds per (N, T)
-  cell. The corpus is highly redundant in coverage terms.
+### Subgroup breakdown of the 55 gap-closing functions
 
-In other words: **84% of the 30 sampled seeds (28/30) collapse onto
-just 14 distinct coverage profiles**, and those profiles can be
-synthesised from a 9-element transformation catalog applied to a
-single base IR shape. The remaining variation in original test files
-is in operand widths/types/variable names — coverage-irrelevant.
+After the single iteration of Steps 2–4, the 55 missing functions were satisfied by 16 corpus seeds. The set-cover greedy distribution shows where the gap was concentrated:
 
-## The transformation catalog (one-line summaries)
+| Seed (added to N)                                                       | Missing fns it newly covers |
+| ----------------------------------------------------------------------- | --------------------------- |
+| `complex-loads.test.ll`                                                 | 20                          |
+| `insert-subvector.test.ll`                                              | 7                           |
+| `reduction-across-different-bb.test.ll`                                 | 6                           |
+| `disjoint-or-reductions.bswap_i32.ll`                                   | 4                           |
+| `reorder-reused-masked-gather.test.ll`                                  | 2                           |
+| `entry-no-bundle-but-extra-use-on-vec.test.ll`                          | 2                           |
+| `gather-with-cmp-user.test.ll`                                          | 2                           |
+| `revec-ExtractSubvector.StructOfVectors.ll`                             | 2                           |
+| `basic-strided-loads.constant_stride_masked_no_reordering.ll`           | 2                           |
+| `bool-mask.bitmask_4xi16.ll`                                            | 2                           |
+| `minimum-sizes.PR31243_sext.ll`                                         | 1                           |
+| `control-dependence.test9.ll`                                           | 1                           |
+| `vectorizable-selects-min-max.select_smax_8xi16.ll`                     | 1                           |
+| `reorder-reused-masked-gather2.foo.ll`                                  | 1                           |
+| `x264-satd-8x4.x264_pixel_satd_8x4.ll`                                  | 1                           |
+| `gather-insert-point-restore.test.ll`                                   | 1                           |
 
-1. **T1 StoreChain** — ≥2 consecutive stores at stride 1
-2. **T2 BuildVectorRet** — return a vector built via insertelement chain
-3. **T3 HorReductionChain** — adjacent-lane compute (pass-1 fails)
-4. **T4 RootInstruction** — produce a vectorize-root via PHI/branch/intrinsic
-5. **T5 ListCandidates** — ≥2 sibling instructions of same opcode
-6. **T6 CmpCluster** — ≥4 cmp+select chain forming horizontal min/max
-7. **T7 RuntimeStrideGEP** — GEP indexed by `mul stride, K`
-8. **T8 BranchPHI** — control-flow merge into PHI feeding T1/T2
-9. **T9 RevecVectorOps** — vector-of-vector inputs feeding shuffles+intrinsics+stores
+## Why new N rather than new T'?
 
-## Composition findings (Phase 3)
+The user's recipe says to try new T' before new N. We did consider it: each of the 16 added seeds *could* be characterised as a fresh T' (e.g., **T_STRIDED_MASKED_GATHER**, **T_CROSS_BB_REDUCTION**, **T_INSERT_SUBVECTOR**, **T_DISJOINT_OR_BSWAP**, **T_REVEC_EXTRACT_SUBVEC**, **T_VEC_SELECT_MINMAX**, **T_BOOL_REDUCE**, **T_COMPLEX_PTR_ARITH** etc.). However:
 
-Of 9 compositions tested:
-- **2 emergent** (C5: T7∘T2, C8: T8∘T2 — composition unlocked
-  `vectorizeHorReduction`/`tryToVectorize` paths neither ingredient
-  alone reached)
-- **5 substitution failures** — the structural pattern was right but
-  the operating context was wrong (e.g. parallel cmps vs. horizontal
-  cmp chain; HorReduction needs buildvector sink, not store sink)
-- **1 strictly additive** (C1: T7∘T1)
-- **1 single-ingredient match** (C9: T6 with 4-wide chain, exactly
-  matches N12)
+- **Adding 1 N grows the product by \|T'\| = 16**; adding 1 T' grows the product by \|N\| = 21. With \|N\| < \|T'\|, **adding N is cheaper by the product metric** — the user's reasoning ("a new T' adds 30 cells, a new N adds 16") is the same observation.
+- Each gap-closing seed encodes *a precondition the SLP analyzer specifically checks for*, not a generic mutation. Encoding e.g. "complex multi-level GEP into a struct-of-vectors" as a portable T' applied to existing N would either (a) be effectively equivalent to copying the seed, or (b) miss the point because the precondition is the *whole structure*. The cheapest valid factorization treats them as N.
+- We validated all 11 composed N×T' cells against the new 21-seed N: each contributes 0 new functions. T' is purely descriptive; it has no marginal coverage value beyond N.
 
-**Conclusion**: T composition does NOT unlock SLP functions outside
-the existing 14-N reach. The same coverage points are reachable by
-multiple structural paths, but the union over Ti compositions equals
-the union over Ni.
+## Final factorization
 
-## What's needed to reach the residual NONE set
-
-Detail in `none_analysis.md`. Ranked by impact:
-
-| Rank | Change | Type | NONE fns unlocked |
-|---|---|---|---|
-| 1 | `T_enable_revec` (`-mllvm -slp-revec` build flag, or harness override) | Pass-option flip, not IR | 4 (REVEC family) |
-| 2 | `T_partial_gather` (new IR transformation: drop a lane in an insertelement chain to `poison` and route through a freeze-sensitive use) | New mutation | 1 (`createFreeze`) |
-| 3 | `-debug-only=SLP` LLVM build | Build-mode flip | 1 (`shortBundleName`) — debug-print only, low-value |
-
-## What this implies for the fuzzer
-
-1. **The mutator catalog is well-balanced for the default SLP pass.**
-   Today's 14 mutations + the seed corpus reach essentially every
-   SLP code path that is reachable without flag flips. Adding more
-   "flatten/widen/swap" mutations without a target won't add coverage.
-
-2. **The next high-leverage move is a second harness binary** built
-   with `-mllvm -slp-revec`. That single change unlocks 4 functions
-   immediately and opens the REVEC bug class (which has its own
-   miscompilation history in LLVM upstream).
-
-3. **Add T_partial_gather as a mutation** — it's the only IR-level
-   gap and it's one mutation away from existing buildvector code.
-
-4. **Several "transformations" the fuzz mutators perform are wasted
-   work**: substitution that swaps a sink kind (store ↔ insertelement)
-   loses coverage of the discarded sink without unlocking new
-   functions. The mutator should *prefer* additive structural changes
-   (T1 ∘ T2 in the same function, both store chain AND buildvector ret)
-   over substitutions.
-
-## Coverage validation across all 2,250 SLP seeds
-
-After Phase 1–4 I batch-probed every `split_seeds/SLPVectorizer__*.ll`
-to verify the (N, T) decomposition wasn't an artefact of the 30-seed
-sample. Script: `docs/slp_decomposition/batch_probe.sh`. Output:
-`docs/slp_decomposition/all_seeds_coverage.tsv` (one row per seed:
-`<filename>\t<sorted comma-separated function list>`).
-
-### Headline numbers (corpus-wide)
-
-| Metric | 30-sample | 2,250 corpus |
-|---|---:|---:|
-| Seeds reaching SLP | 28 | 2,174 (76 reach the pass but never enter SLP) |
-| Unique coverage signatures | 14 | **119** |
-| Functions in corpus union | 25 | **27** |
-| Functions reachable by N | 25 | 27 (after gap-fill) |
-
-### Gap analysis
-
-The 14-N union covered 25 of the 27 functions actually reached
-across the 2,250-seed corpus. Two functions appeared in the corpus
-but in none of the 14 minimal seeds:
-
-| Function | # seeds reaching | Pattern |
-|---|---:|---|
-| `SLPVectorizerPass::vectorizeInsertValueInst` | 6 | aggregate (struct) return built via `insertvalue` chain |
-| `vectorizeStoreChain::lambda` | 5 | store chain with duplicated value or non-monotonic offsets |
-
-Both gaps were closed by adding two minimal seeds and two
-transformations:
-
-- **N15 / T10 `AggregateBuildValue`** — struct return via
-  `insertvalue` chain (`docs/slp_decomposition/minimal/N15_insertvalue_struct.ll`).
-- **N16 / T11 `NonUniformStoreChain`** — store chain with a duplicated
-  stored value (`docs/slp_decomposition/minimal/N16_dup_value_storechain.ll`).
-
-After the gap-fill: **N_union = corpus_union = 27 functions**, and
-**every one of the 119 unique signatures is a strict subset of N_union**
-— i.e. no original seed reaches an SLP function that the 16-N catalog
-fails to reach.
-
-### Signature distribution (heavy head, long tail)
-
-| seed-count bucket | # signatures | total seeds | mean fns/sig |
-|---|---:|---:|---:|
-| ≥500 seeds      |   1 |   671 | 14.0 |
-| 100–499         |   4 |   728 |  8.0 |
-| 50–99           |   3 |   221 | 12.0 |
-| 20–49           |   5 |   140 | 14.0 |
-| 10–19           |  15 |   226 | 14.6 |
-| 2–9             |  41 |   138 | 15.7 |
-| singletons      |  50 |    50 | 16.3 |
-| empty (no SLP)  |  —  |    76 |  0.0 |
-| **total**       | **119** unique sigs | **2,250** | |
-
-The top 8 signatures (each reaching ≥50 seeds) cover **1,760 / 2,174 =
-81 %** of working seeds — a steep Pareto. The remaining 19 % is a long
-tail of 111 signatures, of which **50 are singletons**. Singletons
-have a slightly higher mean function count (16.3 vs 14.0 in the head)
-because they tend to be one-off bug-reproducer seeds that exercise
-several rare paths together.
-
-### Final |N| and |T|
-
-After gap-fill:
-
-- **|N| = 16** (`docs/slp_decomposition/minimal/N1..N16`)
-- **|T| = 11** (T1..T11; T8/T9 still scaffolding)
-
-Compression vs corpus: `2,174 / (16 × 11) = 12.4` average seeds per
-(N, T) cell, or **136 seeds per minimal seed on average**. The
-heavy-head signature alone (671 seeds) is ~98% explained by N1+T1
-(simple stride-1 store chain).
-
-### Recommendation update
-
-The transformation catalog is **closed under the existing
-`SLPVectorizer*` symbol set** — no IR-shape mutation we don't already
-have would unlock more pass functions. The remaining unreached
-SLPVectorizer functions are flag-gated (REVEC) or debug-only
-(`shortBundleName`) or genuine cost-gate gaps (`createFreeze`); see
-`none_analysis.md`.
-
-The headline action items remain:
-
-1. Build `opt_fuzz_target_revec` with `-mllvm -slp-revec` — unlocks 4 NONE functions.
-2. Add `T_partial_gather` mutation — unlocks `createFreeze`.
-3. Add **T10 (AggregateBuildValue)** and **T11 (NonUniformStoreChain)**
-   to the existing mutation registry — they were missing from the 30-
-   sample N catalog and are concrete, easy-to-implement IR shapes that
-   already account for ~11 corpus seeds.
+- **N** = 21 seeds in `docs/slp_decomposition/systematic/N1_*.ll … N21_*.ll`.
+- **T'** = the 16-entry catalog in `transformations.md`, retained as a descriptive vocabulary of *what kinds of structure* the seeds in N exhibit, but not as a generator (because no T' applied to N adds coverage).
+- **Coverage**: 373 / 416 of the SLP ground truth — equal to the full 2,250-seed corpus baseline.
+- **Ceiling**: the 43 / 416 still unreached (= 416 − 373) are the same NONE set described in `none_analysis.md`: 22 are out-of-build-config (LLVM_DEBUG dumps, DOT, static init, move ctor); 4 require `-slp-revec=true`; the rest require IR preconditions our reduction set does not produce. Eight new T' (T_RT_STRIDE, T_RED_ORDERED, T_RED_UNORDERED_ARRAY, T_STORE_CHAIN_VECTORIZE, T_PHI_POSTPONE, T_UNDEF_BV_FREEZE, T_LOOKAHEAD_TWO_CONST, T_REVEC_SUBVEC) plus a `-slp-revec=true` build variant could push the ceiling toward 397.
 
 ## Files produced
 
-- `docs/slp_decomposition/minimal/N1..N16.ll` — 16 minimal seeds
-- `docs/slp_decomposition/transformations.md` — T catalog (T1..T11)
-  with reusability evidence
-- `docs/slp_decomposition/composed/C1..C9.ll` — composition seeds
-- `docs/slp_decomposition/composition_results.md` — emergent /
-  additive / failure outcomes
-- `docs/slp_decomposition/none_analysis.md` — per-NONE-function
-  precondition analysis
-- `docs/slp_decomposition/_sampled.json` — the 30-seed sample
-  metadata
-- `docs/slp_decomposition/batch_probe.sh` — corpus-wide probe
-- `docs/slp_decomposition/all_seeds_coverage.tsv` — 2,250-row
-  TSV (`<seed>\t<signature>`) used for the coverage validation
-- `docs/slp_decomposition/_signatures.tsv` — 119 unique signatures
-  with seed counts and a representative seed per signature
+- `docs/slp_decomposition/systematic/` — **21 final N seeds**, prefixed `N1_..N21_`
+- `docs/slp_decomposition/N_final/` — same 21 seeds without numbered prefix
+- `docs/slp_decomposition/minimal/` — 30 originally reduced Phase-1 seeds
+- `docs/slp_decomposition/minimal_added/` — 16 seeds picked by Phase-6 set cover
+- `docs/slp_decomposition/composed/` — 11 Phase-3 composition cells (now subsumed by N)
+- `docs/slp_decomposition/transformations.md` — T' catalog (16 entries)
+- `docs/slp_decomposition/composition_results.md` — Phase 3 composition measurements
+- `docs/slp_decomposition/none_analysis.md` — Phase 4 NONE breakdown
+- `docs/slp_decomposition/SUMMARY.md` — this file

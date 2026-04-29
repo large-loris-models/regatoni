@@ -1,0 +1,31 @@
+seed	original_lines	minimal_lines	cov_416	notes
+SLPVectorizer__add_sub_sat.uadd_sat_v4i16	68	22	138	
+SLPVectorizer__alternate-cmp-swapped-pred-parent.test1	18	7	10	
+SLPVectorizer__arith-div.srem_v16i32_uniformconst	98	53	140	
+SLPVectorizer__arith-fshr.fshr_v16i32	200	48	131	
+SLPVectorizer__arith-fshr-rot.fshr_v32i16	291	68	133	partial reduction (timeout)
+SLPVectorizer__blending-shuffle-inseltpoison.k	15	14	189	
+SLPVectorizer__buildvector-schedule-for-subvector.test	20	5	4	
+SLPVectorizer__buildvector_splat_extractvalue.test	37	36	10	
+SLPVectorizer__cmp_commute-inseltpoison.icmp_eq_v4i32	24	23	153	
+SLPVectorizer__compare-node-with-reuses.test_inc_1	66	65	241	
+SLPVectorizer__copyable_reorder.test_add_udiv_commuted	27	26	207	
+SLPVectorizer__crash_mandeltext.main	50	49	10	
+SLPVectorizer__crash_mandeltext.rc4_crypt	22	22	0	reduction failed (struct types/parse), original kept
+SLPVectorizer__c-ray.ray_sphere	301	301	0	reduction failed (struct types/parse), original kept
+SLPVectorizer__ctlz.ctlz_undef_16i8	57	56	123	
+SLPVectorizer__cttz.cttz_16i16	71	56	125	
+SLPVectorizer__fcopysign.fcopysign_8f32	59	41	124	
+SLPVectorizer__fminimumnum.fmax16	45	44	68	
+SLPVectorizer__gep-with-extractelement-many-users.test	14	10	11	
+SLPVectorizer__hadd-inseltpoison.test_v8i32	61	35	175	
+SLPVectorizer__horizontal.add_red	45	44	156	
+SLPVectorizer__horizontal.nsw_propagation_v4i32	21	14	116	
+SLPVectorizer__load-store.splat_store_i32_zero	17	11	10	
+SLPVectorizer__perfect-matched-reused-bv.test	23	13	10	
+SLPVectorizer__PR36280.jacobi	12	11	161	
+SLPVectorizer__sitofp.sitofp_16i8_16f32	85	55	121	
+SLPVectorizer__sitofp.sitofp_2i32_2f64	14	13	122	
+SLPVectorizer__split-vectorize-gathered-def-after-use.test	95	94	4	
+SLPVectorizer__strided-loads-with-external-use-ptr.test	17	17	0	reduction failed (struct types/parse), original kept
+SLPVectorizer__uitofp.uitofp_16i16_16f32	85	55	121	
