@@ -8,6 +8,7 @@ deps/
 # Environment
 .env
 regatoni.local.conf
+.claude
 
 # Corpus runtime data (seeds checked in separately)
 corpus/
