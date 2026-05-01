@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # Automated miscompilation triage:
-#   - collect *.reduced.ll witnesses from $PROJECT_ROOT/miscompilations/
-#   - match each to its alive-tv log under build/oracle_results/alive_tv*/fail/
-#   - normalize via scripts/analysis/normalize_ir.py
-#   - diff against triage/triaged.manifest to find new findings; if there
-#     are none, exit early
-#   - stage findings and a tool-path-substituted TRIAGE_PLAYBOOK.md into a
-#     temp working directory; in incremental mode the prior report is also
-#     copied in as PREVIOUS_REPORT.md and only new findings are staged
-#   - launch a Claude Code session in that directory; its stdout becomes
-#     triage/report.md
-#   - update triage/triaged.manifest and triage/last_run.json
+#   - normalize *.reduced.ll witnesses under $PROJECT_ROOT/miscompilations/
+#   - backfill the dedup database (idempotent)
+#   - for each bucket with untriaged findings, invoke the LLM agent on all
+#     findings in that bucket (sample if > MAX_PER_BUCKET; second-pass match
+#     the remainder); persist a sub-clustering of the bucket into
+#     dedup.db.sub_clusters
+#   - regenerate triage/report.md from sub-clusters (not from buckets)
+#
+# Per-bucket gating: a bucket needs triage iff it has at least one finding
+# with no row in finding_sub_cluster. Failure on one bucket leaves its
+# findings untriaged and a later run retries them; other buckets advance.
 #
 # Usage:
-#   triage_miscompilations.sh [--dry-run] [--force]
-#     --force  ignore the manifest, re-triage every finding from scratch
-
-# NOTE!!!!!!!!! PLEASE READ THIS!!!! 
-# TODO: Currently, I use "dangerously-skip-permissions" which is not good. We will have to
-# find the right tools required, to enable a safe sandbox mode in the future
-
+#   triage_miscompilations.sh [--dry-run] [--force] [--backend NAME]
+#     --force  re-triage every bucket from scratch (overwrites prior
+#              sub-clusters via record-sub-clusters --replace)
+#
+# NOTE: the agent runs with --dangerously-skip-permissions / -bypass flags.
+# TODO: replace with a sandboxed mode once the necessary tools are scoped.
 
 set -uo pipefail
 
@@ -36,7 +35,7 @@ while (( $# > 0 )); do
         --backend) BACKEND_ARG="${2:-}"; shift ;;
         --backend=*) BACKEND_ARG="${1#--backend=}" ;;
         -h|--help)
-            sed -n '2,16p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *)
@@ -49,13 +48,14 @@ done
 
 NORMALIZE="$SCRIPT_DIR/normalize_ir.py"
 MISC_DIR="$PROJECT_ROOT/miscompilations"
-ORACLE_ROOT="$BUILD_OUT/oracle_results"
 TRIAGE_DIR="$PROJECT_ROOT/triage"
-PLAYBOOK_SRC="$SCRIPT_DIR/TRIAGE_PLAYBOOK.md"
 REPORT="$TRIAGE_DIR/report.md"
 LAST_RUN="$TRIAGE_DIR/last_run.json"
-TRIAGED_MANIFEST="$TRIAGE_DIR/triaged.manifest"
 TRIAGE_LOG="$TRIAGE_DIR/triage.log"
+DEDUP_PY="$SCRIPT_DIR/dedup.py"
+DEDUP_LOG="$PROJECT_ROOT/miscompilations/dedup.log"
+ORCHESTRATOR="$SCRIPT_DIR/triage_buckets.py"
+MAX_PER_BUCKET="${TRIAGE_MAX_PER_BUCKET:-15}"
 
 mkdir -p "$TRIAGE_DIR"
 
@@ -71,226 +71,130 @@ if [[ ! -d "$MISC_DIR" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$PLAYBOOK_SRC" ]]; then
-    echo "error: playbook not found: $PLAYBOOK_SRC" >&2
-    exit 1
-fi
-
-# Build the index of alive-tv fail logs once: log_basename → full path.
-# Multiple alive_tv shards (alive_tv_0, alive_tv_1, ...) are searched.
-declare -A LOG_INDEX
-shopt -s nullglob
-for shard in "$ORACLE_ROOT"/alive_tv "$ORACLE_ROOT"/alive_tv_*; do
-    [[ -d "$shard/fail" ]] || continue
-    for f in "$shard/fail"/*.log; do
-        base="$(basename "$f")"
-        LOG_INDEX["$base"]="$f"
-    done
-done
-shopt -u nullglob
-
-# Collect (reduced_ll, log) pairs.
-PAIRS=()
-SKIPPED=0
+# Normalize new *.reduced.ll witnesses.
 shopt -s nullglob
 for reduced in "$MISC_DIR"/*.reduced.ll; do
-    base="$(basename "$reduced" .reduced.ll)"  # strip .reduced.ll
-    log_key="${base}.log"
-    log_path="${LOG_INDEX[$log_key]:-}"
-    if [[ -z "$log_path" ]]; then
-        SKIPPED=$((SKIPPED + 1))
-        continue
-    fi
-    PAIRS+=("$reduced|$log_path")
-done
-shopt -u nullglob
-
-if (( ${#PAIRS[@]} == 0 )); then
-    echo "no findings to triage (skipped $SKIPPED without matching log)" >&2
-    exit 0
-fi
-
-echo "[triage] found ${#PAIRS[@]} findings ($SKIPPED skipped without log)" >&2
-
-# Normalize each *.reduced.ll → *.reduced.normalized.ll (skip if up to date).
-NORMALIZED_FILES=()
-for pair in "${PAIRS[@]}"; do
-    reduced="${pair%%|*}"
     norm="${reduced%.ll}.normalized.ll"
     if [[ ! -f "$norm" || "$reduced" -nt "$norm" ]]; then
         if ! python3 "$NORMALIZE" "$reduced" "$norm" >/dev/null 2>&1; then
-            # Fall back to the raw reduced file if normalization fails.
             cp "$reduced" "$norm"
             echo "[triage] normalize failed for $(basename "$reduced"); using raw" >&2
         fi
     fi
-    NORMALIZED_FILES+=("$norm")
 done
+shopt -u nullglob
 
-# Build basename → (ll_src, log_path) maps so we can decide what to stage.
-declare -A LL_SRC_BY_NAME
-declare -A LOG_BY_NAME
-for ((i = 0; i < ${#PAIRS[@]}; i++)); do
-    pair="${PAIRS[$i]}"
-    reduced="${pair%%|*}"
-    log_path="${pair##*|}"
-    norm="${NORMALIZED_FILES[$i]}"
-    if [[ -f "$norm" ]]; then
-        ll_src="$norm"
-    else
-        ll_src="$reduced"
-    fi
-    name="$(basename "$ll_src")"
-    LL_SRC_BY_NAME["$name"]="$ll_src"
-    LOG_BY_NAME["$name"]="$log_path"
-done
-
-# Sorted list of every basename in the current set.
-mapfile -t CURRENT_SORTED < <(printf '%s\n' "${!LL_SRC_BY_NAME[@]}" | sort)
-
-# Diff against the manifest of previously-triaged filenames to decide whether
-# this is a fresh, incremental, or no-op run. --force always treats the run
-# as fresh and triages everything.
-NEW_FILES=()
-if (( FORCE == 0 )) && [[ -f "$TRIAGED_MANIFEST" ]]; then
-    mapfile -t NEW_FILES < <(comm -23 \
-        <(printf '%s\n' "${CURRENT_SORTED[@]}") \
-        <(sort -u "$TRIAGED_MANIFEST"))
-    if (( ${#NEW_FILES[@]} == 0 )); then
-        echo "No new findings to triage" >&2
-        exit 0
-    fi
+# Backfill any unregistered findings (idempotent).
+echo "[triage] backfilling dedup database..." >&2
+if ! python3 "$DEDUP_PY" migrate >>"$DEDUP_LOG" 2>&1; then
+    echo "[triage] WARN: dedup migrate failed, see $DEDUP_LOG" >&2
 fi
 
-INCREMENTAL=0
-if (( FORCE == 0 )) && [[ -f "$REPORT" ]] && (( ${#NEW_FILES[@]} > 0 )); then
-    INCREMENTAL=1
-fi
-
-# Stage everything for claude in a temp working directory.
-WORK_DIR="$(mktemp -d -t triage.XXXXXX)"
-
-cleanup() {
-    if (( DRY_RUN == 0 )); then
-        rm -rf "$WORK_DIR"
-    fi
-}
-trap cleanup EXIT
-
-# Decide which findings to copy in. In incremental mode we only stage the
-# new ones and let claude reconcile against the prior report; in fresh mode
-# we stage every finding in the current set.
-if (( INCREMENTAL == 1 )); then
-    STAGE_LIST=("${NEW_FILES[@]}")
-    cp "$REPORT" "$WORK_DIR/PREVIOUS_REPORT.md"
-else
-    STAGE_LIST=("${CURRENT_SORTED[@]}")
-fi
-
-for ll_name in "${STAGE_LIST[@]}"; do
-    cp "${LL_SRC_BY_NAME[$ll_name]}" "$WORK_DIR/$ll_name"
-    cp "${LOG_BY_NAME[$ll_name]}" "$WORK_DIR/${ll_name}.log"
-done
-
-# Copy the playbook, expanding the whitelisted ${VAR} placeholders to
-# project-local tool paths. The whitelist keeps envsubst from touching
-# unrelated $-tokens in the playbook prose.
-envsubst '${ALIVE_TV} ${OPT} ${LLVM_BUILD_PLAIN} ${LLVM_SRC}' \
-    < "$PLAYBOOK_SRC" \
-    > "$WORK_DIR/TRIAGE_PLAYBOOK.md"
-
-if (( INCREMENTAL == 1 )); then
-    MODE_LABEL="incremental"
-else
-    MODE_LABEL="fresh"
-fi
-
-if (( DRY_RUN == 1 )); then
-    echo "=== DRY RUN ===" >&2
-    echo "mode: $MODE_LABEL" >&2
-    echo "findings (current): ${#PAIRS[@]}" >&2
-    echo "staged: ${#STAGE_LIST[@]}" >&2
-    echo "work dir (preserved): $WORK_DIR" >&2
-    echo "$WORK_DIR"
-    exit 0
-fi
-
-# Pick the LLM backend. Priority: $TRIAGE_BACKEND env var, then --backend
-# flag, then auto-detect (claude preferred, codex as fallback).
+# Pick backend.
 BACKEND="${TRIAGE_BACKEND:-$BACKEND_ARG}"
 if [[ -z "$BACKEND" ]]; then
-    if command -v claude >/dev/null 2>&1; then
-        BACKEND="claude"
-    elif command -v codex >/dev/null 2>&1; then
-        BACKEND="codex"
+    if command -v claude >/dev/null 2>&1; then BACKEND="claude"
+    elif command -v codex >/dev/null 2>&1; then BACKEND="codex"
     else
         echo "error: no LLM CLI found; install 'claude' or 'codex'" >&2
         exit 2
     fi
 fi
-
 case "$BACKEND" in
     claude|codex) ;;
-    *)
-        echo "error: unknown backend '$BACKEND' (expected 'claude' or 'codex')" >&2
-        exit 2
-        ;;
+    *) echo "error: unknown backend '$BACKEND'" >&2; exit 2 ;;
 esac
-
 if ! BACKEND_BIN="$(command -v "$BACKEND")"; then
     echo "error: '$BACKEND' CLI not found on PATH" >&2
     exit 2
 fi
 
-run_llm_triage() {
-    local work_dir="$1" prompt="$2"
-    case "$BACKEND" in
-        claude)
-            (cd "$work_dir" && "$BACKEND_BIN" --dangerously-skip-permissions -p "$prompt")
-            ;;
-        codex)
-            "$BACKEND_BIN" exec --dangerously-bypass-approvals-and-sandbox -C "$work_dir" "$prompt"
-            ;;
-    esac
-}
-
-if (( INCREMENTAL == 1 )); then
-    PROMPT="Read TRIAGE_PLAYBOOK.md. A previous report exists at PREVIOUS_REPORT.md. New findings are the .ll and .ll.log files in this directory. Follow the incremental update instructions in the playbook."
+# Compute the list of buckets that need work, for logging / dry-run.
+if (( FORCE == 1 )); then
+    mapfile -t BUCKETS < <(python3 -c "
+import sqlite3, os
+c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'miscompilations', 'dedup.db'))
+for r in c.execute('SELECT bucket_id FROM buckets ORDER BY bucket_id'):
+    print(r[0])
+")
 else
-    PROMPT="Read TRIAGE_PLAYBOOK.md and follow the fresh triage instructions. The .ll and .ll.log files are in this directory."
+    mapfile -t BUCKETS < <(python3 -c "
+import sqlite3, os
+c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'miscompilations', 'dedup.db'))
+sql = '''SELECT DISTINCT f.bucket_id FROM findings f
+         LEFT JOIN finding_sub_cluster fsc ON fsc.finding_id = f.finding_id
+         WHERE fsc.sub_cluster_id IS NULL
+         ORDER BY f.bucket_id'''
+for r in c.execute(sql):
+    print(r[0])
+")
 fi
 
-echo "[triage] launching $BACKEND in $WORK_DIR ($MODE_LABEL, ${#STAGE_LIST[@]} of ${#PAIRS[@]} findings staged)..." >&2
-TMP_REPORT="$(mktemp)"
-if ! run_llm_triage "$WORK_DIR" "$PROMPT" 2>>"$TRIAGE_LOG" > "$TMP_REPORT"; then
-    rc=$?
-    rm -f "$TMP_REPORT"
-    echo "[triage] $BACKEND session failed (exit $rc)" >&2
-    exit "$rc"
+if (( ${#BUCKETS[@]} == 0 )); then
+    echo "[triage] no buckets need triage" >&2
+    if [[ ! -f "$REPORT" ]]; then
+        python3 "$SCRIPT_DIR/render_triage_report.py" --output "$REPORT"
+        echo "[triage] wrote $REPORT" >&2
+    fi
+    exit 0
 fi
-mv "$TMP_REPORT" "$REPORT"
+
+if (( DRY_RUN == 1 )); then
+    echo "=== DRY RUN ===" >&2
+    echo "backend: $BACKEND" >&2
+    echo "force: $FORCE" >&2
+    echo "max_per_bucket: $MAX_PER_BUCKET" >&2
+    echo "buckets needing triage: ${#BUCKETS[@]} -> ${BUCKETS[*]}" >&2
+    exit 0
+fi
+
+echo "[triage] backend=$BACKEND buckets=${#BUCKETS[@]} max_per_bucket=$MAX_PER_BUCKET" >&2
+
+RUN_TS="$(date -Is)"
+
+ORCH_ARGS=(--backend "$BACKEND" --backend-bin "$BACKEND_BIN"
+           --log "$TRIAGE_LOG" --max-per-bucket "$MAX_PER_BUCKET")
+if (( FORCE == 1 )); then
+    ORCH_ARGS+=(--force)
+fi
+
+# Orchestrator returns non-zero only if at least one bucket failed; we still
+# want to regenerate the report from whatever did succeed.
+set +e
+python3 "$ORCHESTRATOR" "${ORCH_ARGS[@]}"
+ORCH_RC=$?
+set -e
+
+# Regenerate report.md from sub_clusters.
+python3 "$SCRIPT_DIR/render_triage_report.py" --output "$REPORT"
 echo "[triage] wrote $REPORT" >&2
 
-# Manifest of every filename now reflected in the report. The next run diffs
-# against this to find new findings.
-printf '%s\n' "${CURRENT_SORTED[@]}" > "$TRIAGED_MANIFEST"
-echo "[triage] wrote $TRIAGED_MANIFEST (${#CURRENT_SORTED[@]} entries)" >&2
-
-# last_run.json: timestamp + count + file list.
-{
-    printf '{\n'
-    printf '  "timestamp": "%s",\n' "$(date -Is)"
-    printf '  "mode": "%s",\n' "$MODE_LABEL"
-    printf '  "count": %d,\n' "${#PAIRS[@]}"
-    printf '  "staged": %d,\n' "${#STAGE_LIST[@]}"
-    printf '  "files": [\n'
-    n=${#NORMALIZED_FILES[@]}
-    for ((i = 0; i < n; i++)); do
-        comma=','
-        (( i == n - 1 )) && comma=''
-        printf '    "%s"%s\n' "$(basename "${NORMALIZED_FILES[$i]}")" "$comma"
-    done
-    printf '  ]\n'
-    printf '}\n'
-} > "$LAST_RUN"
+# last_run.json: timestamp + counts.
+python3 - "$RUN_TS" "$LAST_RUN" "$ORCH_RC" <<'PYEOF'
+import json, sqlite3, sys, os
+run_ts, last_run_path, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+db = os.path.join(os.environ["PROJECT_ROOT"], "miscompilations", "dedup.db")
+c = sqlite3.connect(db)
+n_findings = c.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+n_buckets = c.execute("SELECT COUNT(*) FROM buckets").fetchone()[0]
+n_sc = c.execute("SELECT COUNT(*) FROM sub_clusters").fetchone()[0]
+n_untriaged = c.execute(
+    "SELECT COUNT(*) FROM findings f LEFT JOIN finding_sub_cluster fsc "
+    "ON fsc.finding_id = f.finding_id WHERE fsc.sub_cluster_id IS NULL"
+).fetchone()[0]
+with open(last_run_path, "w") as f:
+    json.dump({
+        "timestamp": run_ts,
+        "orchestrator_exit": rc,
+        "findings_total": n_findings,
+        "buckets_total": n_buckets,
+        "sub_clusters_total": n_sc,
+        "findings_untriaged": n_untriaged,
+    }, f, indent=2)
+PYEOF
 echo "[triage] wrote $LAST_RUN" >&2
+
+if (( ORCH_RC != 0 )); then
+    echo "[triage] orchestrator reported failures (exit $ORCH_RC); see $TRIAGE_LOG" >&2
+fi
+exit "$ORCH_RC"

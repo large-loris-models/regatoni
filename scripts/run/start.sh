@@ -169,6 +169,10 @@ trap shutdown INT TERM
 FUZZ_WORKDIR="$BUILD_OUT/workdir_$(date +%m%d%Y)"
 mkdir -p "$FUZZ_WORKDIR" "$CORPUS_DIR"
 
+# Harness reads this to pick a directory for regatoni-mutation-stats.<pid>.csv.
+# Centipede propagates env vars into the runner subprocesses.
+export REGATONI_WORKDIR="$FUZZ_WORKDIR"
+
 # Copy seeds into corpus dir if empty
 if [[ -d "$SPLIT_SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
     log "Copying seeds into corpus dir..."
@@ -188,6 +192,16 @@ FUZZER_FLAGS=(
     --use_counter_features
     --v=1
     --max_num_crash_reports=50000
+    # Emit "FUNC: <symbol>" / "EDGE: <symbol>" lines into run.log on first
+    # sighting of each new PC. Required by parse_centipede_log.py for the
+    # events.jsonl feed.
+    --log_features_shards=1
+    # Emit intermediate coverage-report-*.latest.txt / corpus-stats-*.latest.json
+    # / rusage-report-*.latest.txt every N batches. With observed exec/s ~200
+    # and batch sizes of 1000-3000 inputs, batches arrive every ~5-15s, so
+    # N=100 corresponds to roughly 8-25 minutes between snapshots — close to
+    # the 10-minute target. Tune if exec/s deviates substantially.
+    --telemetry_frequency=100
 )
 
 if [[ -n "${CORPUS_WEIGHT_METHOD:-}" && "$CORPUS_WEIGHT_METHOD" != "uniform" ]]; then
@@ -240,6 +254,23 @@ taskset -c "$ASAN_CORE" "$ORACLE_DIR/asan_opt.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>
 ASAN_PID=$!
 record_pid "asan_opt" "$ASAN_PID"
 log "ASAN oracle PID: $ASAN_PID (core $ASAN_CORE)"
+
+# ── Start log parser daemon ─────────────────────────────────────────────────
+
+PARSER="$SCRIPT_DIR/../analysis/parse_centipede_log.py"
+if [[ -x "$PARSER" || -f "$PARSER" ]]; then
+    log "Starting Centipede log parser daemon..."
+    python3 "$PARSER" --watch \
+        --log "$RUN_LOG" \
+        --workdir "$FUZZ_WORKDIR" \
+        --offset-file "$RUN_STATE/run.log.offset" \
+        >> "$RUN_LOG" 2>&1 &
+    PARSER_PID=$!
+    record_pid "log_parser" "$PARSER_PID"
+    log "Log parser PID: $PARSER_PID"
+else
+    log "WARNING: log parser not found at $PARSER — skipping"
+fi
 
 # ── Status banner ───────────────────────────────────────────────────────────
 
