@@ -9,9 +9,22 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+source "$SCRIPT_DIR/../run/run_helpers.sh"
 
 ORACLE_TIMEOUT="${ORACLE_TIMEOUT:-30}"
-ORACLE_RESULTS_ROOT="$BUILD_OUT/oracle_results"
+
+# Resolve the active run directory. start.sh exports RUN_DIR for child
+# processes; standalone invocations fall back to runs/current.
+if [[ -z "${RUN_DIR:-}" ]]; then
+    if RUN_DIR="$(regatoni_run_dir 2>/dev/null)"; then
+        export RUN_DIR
+    else
+        echo "[oracle] ERROR: RUN_DIR unset and runs/current is missing" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+fi
+
+ORACLE_RESULTS_ROOT="$RUN_DIR/oracle_results"
 
 # Sharding: each shard processes a deterministic subset of files.
 ORACLE_SHARD_ID="${ORACLE_SHARD_ID:-0}"

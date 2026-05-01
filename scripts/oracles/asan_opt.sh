@@ -18,7 +18,7 @@ CORPUS="${1:-$CORPUS_DIR}"
 
 oracle_init "asan_opt"
 
-DEDUP_LOG="$PROJECT_ROOT/miscompilations/dedup.log"
+DEDUP_LOG="$RUN_DIR/dedup.log"
 DEDUP_PY="$SCRIPT_DIR/../analysis/dedup.py"
 
 asan_check() {
@@ -44,16 +44,19 @@ asan_check() {
     if [[ "$verdict" == "fail" ]]; then
         # ASAN findings have no reduction/normalization in v1; register the
         # raw IR. dedup.py skips bisect for oracle=asan_opt and parks the
-        # finding in the (NULL, NULL) bucket per the decision doc.
+        # finding in the '__asan__' sentinel bucket.
         local err_tmp
         err_tmp="$(mktemp)"
         printf '%s' "$output" > "$err_tmp"
-        python3 "$DEDUP_PY" register \
-            --reduced "$ir_file" \
-            --oracle asan_opt \
-            --error-text-file "$err_tmp" \
-            --original-path "$ir_file" \
-            >> "$DEDUP_LOG" 2>&1 || true
+        if ! python3 "$DEDUP_PY" register \
+                --reduced "$ir_file" \
+                --oracle asan_opt \
+                --error-text-file "$err_tmp" \
+                --original-path "$ir_file" \
+                --run-id "${RUN_ID:-}" \
+                >> "$DEDUP_LOG" 2>&1; then
+            oracle_log "dedup register failed for $(basename "$ir_file") (see $DEDUP_LOG)"
+        fi
         rm -f "$err_tmp"
     fi
 }

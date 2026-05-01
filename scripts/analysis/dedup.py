@@ -32,8 +32,10 @@ from pathlib import Path
 
 # Repo root: scripts/analysis/dedup.py -> parents[2].
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = REPO_ROOT / "miscompilations" / "dedup.db"
+DB_PATH = REPO_ROOT / "dedup.db"
 BISECT_SCRIPT = REPO_ROOT / "scripts" / "analysis" / "bisect_blame.sh"
+# Default scan dir for cmd_migrate; per-run miscompilations live under
+# runs/<RUN_ID>/miscompilations and the triage flow passes --misc-dir.
 MISC_DIR = REPO_ROOT / "miscompilations"
 
 SCHEMA = """
@@ -48,14 +50,17 @@ CREATE TABLE IF NOT EXISTS findings (
     reduced_path      TEXT,
     normalized_path   TEXT,
     found_at          TIMESTAMP NOT NULL,
-    bucket_id         INTEGER REFERENCES buckets(bucket_id)
+    bucket_id         INTEGER REFERENCES buckets(bucket_id),
+    run_id            TEXT
 );
 CREATE TABLE IF NOT EXISTS buckets (
     bucket_id         INTEGER PRIMARY KEY,
-    guilty_pass       TEXT NOT NULL,
-    bisect_index      INTEGER NOT NULL,
+    guilty_pass       TEXT,
+    bisect_index      INTEGER,
     first_seen        TIMESTAMP NOT NULL,
     last_seen         TIMESTAMP NOT NULL,
+    -- count of register() calls hitting this bucket; for distinct instances,
+    -- use SELECT COUNT(DISTINCT normalized_hash).
     finding_count     INTEGER NOT NULL DEFAULT 0,
     representative_id INTEGER REFERENCES findings(finding_id),
     triaged_at        TIMESTAMP,
@@ -90,7 +95,133 @@ def connect() -> sqlite3.Connection:
     # schema. (Cannot wrap in an explicit transaction here because
     # executescript() implicitly COMMITs before running its body.)
     conn.executescript(SCHEMA)
+    # Pre-restructure databases predate the run_id column.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
+    if "run_id" not in cols:
+        conn.execute("ALTER TABLE findings ADD COLUMN run_id TEXT")
+    _migrate_buckets_drop_notnull(conn)
+    _migrate_null_buckets_to_sentinels(conn)
     return conn
+
+
+def _migrate_buckets_drop_notnull(conn: sqlite3.Connection) -> bool:
+    """
+    Older schemas declared buckets.guilty_pass / bisect_index NOT NULL, which
+    collided with the (NULL, NULL) bucket the previous register code tried
+    to insert for ASAN / bisect-failed findings. SQLite has no
+    ALTER TABLE DROP CONSTRAINT, so rebuild the table. Idempotent.
+    """
+    info = conn.execute("PRAGMA table_info(buckets)").fetchall()
+    # PRAGMA row: (cid, name, type, notnull, dflt_value, pk)
+    notnull = {r[1]: r[3] for r in info}
+    if notnull.get("guilty_pass", 0) == 0 and notnull.get("bisect_index", 0) == 0:
+        return False
+
+    # PRAGMA foreign_keys cannot toggle inside a transaction. Disable, rebuild,
+    # re-enable. findings.bucket_id values are preserved 1:1.
+    conn.execute("PRAGMA foreign_keys=OFF;")
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        conn.execute("""
+            CREATE TABLE buckets_new (
+                bucket_id         INTEGER PRIMARY KEY,
+                guilty_pass       TEXT,
+                bisect_index      INTEGER,
+                first_seen        TIMESTAMP NOT NULL,
+                last_seen         TIMESTAMP NOT NULL,
+                finding_count     INTEGER NOT NULL DEFAULT 0,
+                representative_id INTEGER REFERENCES findings(finding_id),
+                triaged_at        TIMESTAMP,
+                triage_summary    TEXT,
+                UNIQUE(guilty_pass, bisect_index)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO buckets_new(bucket_id, guilty_pass, bisect_index,
+                first_seen, last_seen, finding_count, representative_id,
+                triaged_at, triage_summary)
+            SELECT bucket_id, guilty_pass, bisect_index, first_seen,
+                   last_seen, finding_count, representative_id, triaged_at,
+                   triage_summary
+            FROM buckets
+        """)
+        conn.execute("DROP TABLE buckets;")
+        conn.execute("ALTER TABLE buckets_new RENAME TO buckets;")
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        raise
+    conn.execute("PRAGMA foreign_keys=ON;")
+    print("[dedup] migrated buckets schema (dropped NOT NULL on "
+          "guilty_pass / bisect_index)", file=sys.stderr)
+    return True
+
+
+def _migrate_null_buckets_to_sentinels(conn: sqlite3.Connection) -> bool:
+    """
+    Fold any pre-existing (NULL, NULL) buckets into sentinel buckets:
+    findings whose oracle is 'asan_opt' move to ('__asan__', 0); the rest
+    move to ('__bisect_failed__', 0). The empty NULL bucket is then deleted.
+    Idempotent — no-op if no NULL buckets exist.
+    """
+    null_buckets = [
+        r[0] for r in conn.execute(
+            "SELECT bucket_id FROM buckets "
+            "WHERE guilty_pass IS NULL AND bisect_index IS NULL"
+        ).fetchall()
+    ]
+    if not null_buckets:
+        return False
+
+    ts = now_iso()
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        for old_bid in null_buckets:
+            findings = conn.execute(
+                "SELECT finding_id, oracle FROM findings WHERE bucket_id = ?",
+                (old_bid,),
+            ).fetchall()
+            for finding_id, oracle in findings:
+                if oracle == "asan_opt":
+                    gp, bi = "__asan__", 0
+                else:
+                    gp, bi = "__bisect_failed__", 0
+                conn.execute(
+                    "INSERT OR IGNORE INTO buckets(guilty_pass, bisect_index, "
+                    "first_seen, last_seen, finding_count) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    (gp, bi, ts, ts),
+                )
+                new_bid = conn.execute(
+                    "SELECT bucket_id FROM buckets "
+                    "WHERE guilty_pass = ? AND bisect_index = ?",
+                    (gp, bi),
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE findings SET bucket_id = ?, guilty_pass = ?, "
+                    "bisect_index = ? WHERE finding_id = ?",
+                    (new_bid, gp, bi, finding_id),
+                )
+                conn.execute(
+                    "UPDATE buckets SET finding_count = finding_count + 1, "
+                    "last_seen = ? WHERE bucket_id = ?",
+                    (ts, new_bid),
+                )
+                conn.execute(
+                    "UPDATE buckets SET representative_id = ? "
+                    "WHERE bucket_id = ? AND representative_id IS NULL",
+                    (finding_id, new_bid),
+                )
+            # Old NULL bucket should now be empty.
+            conn.execute("DELETE FROM buckets WHERE bucket_id = ?", (old_bid,))
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    print(f"[dedup] migrated {len(null_buckets)} (NULL, NULL) bucket(s) "
+          f"into sentinel buckets", file=sys.stderr)
+    return True
 
 
 def with_retry(fn, *args, **kwargs):
@@ -140,66 +271,45 @@ def run_bisect(reduced: Path) -> tuple[str | None, int | None, str | None]:
 
 
 def _do_register(conn: sqlite3.Connection, *, reduced: Path, oracle: str,
-                 error_text: str | None, original_path: str | None) -> dict:
+                 error_text: str | None, original_path: str | None,
+                 run_id: str | None = None) -> dict:
     """
     Single-transaction register. Returns dict with bucket_id, new_bucket,
     new_instance, finding_id.
 
-    ASAN findings (oracle == 'asan_opt') skip bisect entirely per the v1
-    decision (see docs/decisions/2026-05-01_dedup_redesign.md). They register
-    with guilty_pass=NULL, bisect_index=NULL and bucket on (NULL, NULL).
-    Note: SQL UNIQUE treats NULLs as distinct, so the (NULL, NULL) bucket is
-    looked up explicitly here rather than relying on INSERT OR IGNORE.
+    ASAN findings (oracle == 'asan_opt') skip bisect and bucket on the
+    sentinel ('__asan__', 0). alive_tv findings whose bisect returns FAIL
+    bucket on ('__bisect_failed__', 0). Sentinels keep the (guilty_pass,
+    bisect_index) UNIQUE index well-defined and queryable; see the
+    discussion in docs/decisions/2026-05-01_dedup_redesign.md.
     """
     normalized_hash = sha256_file(reduced)
 
     if oracle == "asan_opt":
-        guilty_pass = None
-        bisect_index = None
+        guilty_pass, bisect_index = "__asan__", 0
     else:
         guilty_pass, bisect_index, fail_reason = run_bisect(reduced)
         if fail_reason is not None:
-            # Bisect failed: still record the finding so it isn't lost, but
-            # park it in the (NULL, NULL) bucket alongside ASAN. The error
-            # surfaces in stderr below.
+            # Bisect failed: park the finding in the bisect-failed sentinel
+            # bucket so it isn't lost. The reason surfaces on stderr.
             print(f"[dedup] bisect failed for {reduced}: {fail_reason}",
                   file=sys.stderr)
-            guilty_pass = None
-            bisect_index = None
+            guilty_pass, bisect_index = "__bisect_failed__", 0
 
     conn.execute("BEGIN IMMEDIATE;")
     try:
-        # Resolve / create bucket.
-        if guilty_pass is None and bisect_index is None:
-            row = conn.execute(
-                "SELECT bucket_id FROM buckets "
-                "WHERE guilty_pass IS NULL AND bisect_index IS NULL"
-            ).fetchone()
-            if row is None:
-                cur = conn.execute(
-                    "INSERT INTO buckets(guilty_pass, bisect_index, "
-                    "first_seen, last_seen, finding_count) "
-                    "VALUES (NULL, NULL, ?, ?, 0)",
-                    (now_iso(), now_iso()),
-                )
-                bucket_id = cur.lastrowid
-                new_bucket = True
-            else:
-                bucket_id = row[0]
-                new_bucket = False
-        else:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO buckets(guilty_pass, bisect_index, "
-                "first_seen, last_seen, finding_count) VALUES (?, ?, ?, ?, 0)",
-                (guilty_pass, bisect_index, now_iso(), now_iso()),
-            )
-            new_bucket = (cur.rowcount == 1)
-            row = conn.execute(
-                "SELECT bucket_id FROM buckets "
-                "WHERE guilty_pass = ? AND bisect_index = ?",
-                (guilty_pass, bisect_index),
-            ).fetchone()
-            bucket_id = row[0]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO buckets(guilty_pass, bisect_index, "
+            "first_seen, last_seen, finding_count) VALUES (?, ?, ?, ?, 0)",
+            (guilty_pass, bisect_index, now_iso(), now_iso()),
+        )
+        new_bucket = (cur.rowcount == 1)
+        row = conn.execute(
+            "SELECT bucket_id FROM buckets "
+            "WHERE guilty_pass = ? AND bisect_index = ?",
+            (guilty_pass, bisect_index),
+        ).fetchone()
+        bucket_id = row[0]
 
         # Tier 2: same hash already in this bucket?
         prior = conn.execute(
@@ -213,7 +323,8 @@ def _do_register(conn: sqlite3.Connection, *, reduced: Path, oracle: str,
         cur = conn.execute(
             "INSERT INTO findings(normalized_hash, guilty_pass, bisect_index, "
             "oracle, error_text, original_path, reduced_path, normalized_path, "
-            "found_at, bucket_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "found_at, bucket_id, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 normalized_hash, guilty_pass, bisect_index, oracle, error_text,
                 original_path or str(reduced),
@@ -221,6 +332,7 @@ def _do_register(conn: sqlite3.Connection, *, reduced: Path, oracle: str,
                 str(reduced),
                 now_iso(),
                 bucket_id,
+                run_id,
             ),
         )
         finding_id = cur.lastrowid
@@ -270,6 +382,7 @@ def cmd_register(args) -> int:
             _do_register, conn,
             reduced=reduced, oracle=args.oracle,
             error_text=error_text, original_path=args.original_path,
+            run_id=args.run_id,
         )
     finally:
         conn.close()
@@ -338,10 +451,16 @@ def cmd_bucket_info(args) -> int:
 
 def cmd_migrate(args) -> int:
     """
-    Bulk-register every *.reduced.normalized.ll under miscompilations/ that
-    isn't already in findings.normalized_path. Pairs each with its alive_tv
-    fail log if one is on disk.
+    Bulk-register every *.reduced.normalized.ll under --misc-dir (default
+    miscompilations/) that isn't already in findings.normalized_path. Pairs
+    each with its alive_tv fail log if one is on disk under --oracle-results.
     """
+    misc_dir = Path(args.misc_dir) if args.misc_dir else MISC_DIR
+    oracle_results_root = (
+        Path(args.oracle_results) if args.oracle_results
+        else REPO_ROOT / "build" / "oracle_results"
+    )
+
     conn = connect()
     try:
         already = set(
@@ -352,7 +471,6 @@ def cmd_migrate(args) -> int:
     finally:
         conn.close()
 
-    oracle_results_root = REPO_ROOT / "build" / "oracle_results"
     log_index: dict[str, Path] = {}
     if oracle_results_root.is_dir():
         for shard in oracle_results_root.iterdir():
@@ -364,7 +482,7 @@ def cmd_migrate(args) -> int:
             for log in fail_dir.glob("*.log"):
                 log_index[log.name] = log
 
-    norm_files = sorted(MISC_DIR.glob("*.reduced.normalized.ll"))
+    norm_files = sorted(misc_dir.glob("*.reduced.normalized.ll"))
     n_total = len(norm_files)
     n_skipped = 0
     n_registered = 0
@@ -377,7 +495,7 @@ def cmd_migrate(args) -> int:
         base = norm.name[: -len(".reduced.normalized.ll")]
         log_path = log_index.get(f"{base}.log")
         # original = the unreduced corpus entry, named like the hash
-        original = MISC_DIR / base
+        original = misc_dir / base
         original_str = str(original) if original.exists() else str(norm)
 
         error_text = None
@@ -393,6 +511,7 @@ def cmd_migrate(args) -> int:
                 _do_register, conn,
                 reduced=norm, oracle="alive_tv",
                 error_text=error_text, original_path=original_str,
+                run_id=args.run_id,
             )
         finally:
             conn.close()
@@ -734,6 +853,8 @@ def main() -> int:
     pr.add_argument("--oracle", required=True)
     pr.add_argument("--error-text-file")
     pr.add_argument("--original-path")
+    pr.add_argument("--run-id", default=None,
+                    help="Run ID to attribute this finding to.")
     pr.set_defaults(func=cmd_register)
 
     pn = sub.add_parser("new-buckets-since")
@@ -745,6 +866,14 @@ def main() -> int:
     pb.set_defaults(func=cmd_bucket_info)
 
     pm = sub.add_parser("migrate")
+    pm.add_argument("--misc-dir", default=None,
+                    help="Directory containing *.reduced.normalized.ll. "
+                         "Defaults to <repo>/miscompilations.")
+    pm.add_argument("--oracle-results", default=None,
+                    help="Directory containing per-shard alive_tv*/fail/*.log "
+                         "files. Defaults to build/oracle_results.")
+    pm.add_argument("--run-id", default=None,
+                    help="Attribute migrated findings to this run_id.")
     pm.set_defaults(func=cmd_migrate)
 
     pf = sub.add_parser("findings-in-bucket")

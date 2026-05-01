@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Automated miscompilation triage:
-#   - normalize *.reduced.ll witnesses under $PROJECT_ROOT/miscompilations/
+#   - normalize *.reduced.ll witnesses under $RUN_DIR/miscompilations/
 #   - backfill the dedup database (idempotent)
 #   - for each bucket with untriaged findings, invoke the LLM agent on all
 #     findings in that bucket (sample if > MAX_PER_BUCKET; second-pass match
@@ -24,6 +24,21 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+source "$SCRIPT_DIR/../run/run_helpers.sh"
+
+# Resolve the active run dir. Inherited from the oracle that triggered us if
+# launched in-pipeline; otherwise read runs/current.
+if [[ -z "${RUN_DIR:-}" ]]; then
+    if ! RUN_DIR="$(regatoni_run_dir 2>/dev/null)"; then
+        echo "[triage] ERROR: RUN_DIR unset and runs/current is missing" >&2
+        exit 1
+    fi
+    export RUN_DIR
+fi
+if [[ -z "${RUN_ID:-}" ]]; then
+    RUN_ID="$(basename "$RUN_DIR")"
+    export RUN_ID
+fi
 
 DRY_RUN=0
 FORCE=0
@@ -47,15 +62,17 @@ while (( $# > 0 )); do
 done
 
 NORMALIZE="$SCRIPT_DIR/normalize_ir.py"
-MISC_DIR="$PROJECT_ROOT/miscompilations"
-TRIAGE_DIR="$PROJECT_ROOT/triage"
+MISC_DIR="$RUN_DIR/miscompilations"
+TRIAGE_DIR="$RUN_DIR/triage"
 REPORT="$TRIAGE_DIR/report.md"
 LAST_RUN="$TRIAGE_DIR/last_run.json"
 TRIAGE_LOG="$TRIAGE_DIR/triage.log"
 DEDUP_PY="$SCRIPT_DIR/dedup.py"
-DEDUP_LOG="$PROJECT_ROOT/miscompilations/dedup.log"
+DEDUP_LOG="$RUN_DIR/dedup.log"
+ORACLE_RESULTS_DIR="$RUN_DIR/oracle_results"
 ORCHESTRATOR="$SCRIPT_DIR/triage_buckets.py"
 MAX_PER_BUCKET="${TRIAGE_MAX_PER_BUCKET:-15}"
+DEDUP_DB="$PROJECT_ROOT/dedup.db"
 
 mkdir -p "$TRIAGE_DIR"
 
@@ -84,9 +101,14 @@ for reduced in "$MISC_DIR"/*.reduced.ll; do
 done
 shopt -u nullglob
 
-# Backfill any unregistered findings (idempotent).
-echo "[triage] backfilling dedup database..." >&2
-if ! python3 "$DEDUP_PY" migrate >>"$DEDUP_LOG" 2>&1; then
+# Backfill any unregistered findings (idempotent). Scoped to this run's
+# miscompilations dir and tagged with this run_id.
+echo "[triage] backfilling dedup database (run_id=$RUN_ID)..." >&2
+if ! python3 "$DEDUP_PY" migrate \
+        --misc-dir "$MISC_DIR" \
+        --oracle-results "$ORACLE_RESULTS_DIR" \
+        --run-id "$RUN_ID" \
+        >>"$DEDUP_LOG" 2>&1; then
     echo "[triage] WARN: dedup migrate failed, see $DEDUP_LOG" >&2
 fi
 
@@ -113,14 +135,14 @@ fi
 if (( FORCE == 1 )); then
     mapfile -t BUCKETS < <(python3 -c "
 import sqlite3, os
-c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'miscompilations', 'dedup.db'))
+c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'dedup.db'))
 for r in c.execute('SELECT bucket_id FROM buckets ORDER BY bucket_id'):
     print(r[0])
 ")
 else
     mapfile -t BUCKETS < <(python3 -c "
 import sqlite3, os
-c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'miscompilations', 'dedup.db'))
+c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'dedup.db'))
 sql = '''SELECT DISTINCT f.bucket_id FROM findings f
          LEFT JOIN finding_sub_cluster fsc ON fsc.finding_id = f.finding_id
          WHERE fsc.sub_cluster_id IS NULL
@@ -173,7 +195,7 @@ echo "[triage] wrote $REPORT" >&2
 python3 - "$RUN_TS" "$LAST_RUN" "$ORCH_RC" <<'PYEOF'
 import json, sqlite3, sys, os
 run_ts, last_run_path, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
-db = os.path.join(os.environ["PROJECT_ROOT"], "miscompilations", "dedup.db")
+db = os.path.join(os.environ["PROJECT_ROOT"], "dedup.db")
 c = sqlite3.connect(db)
 n_findings = c.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
 n_buckets = c.execute("SELECT COUNT(*) FROM buckets").fetchone()[0]

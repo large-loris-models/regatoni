@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 render_triage_report.py — emit triage/report.md from sub_clusters in
-miscompilations/dedup.db.
+the project-root dedup.db.
 
 The report is grouped by bucket; each bucket lists its sub-clusters with
 the agent-written summary, representative IR snippet, and Alive2 verdict
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = REPO_ROOT / "miscompilations" / "dedup.db"
+DB_PATH = REPO_ROOT / "dedup.db"
 
 
 def truncate(text: str, max_lines: int, max_chars: int) -> str:

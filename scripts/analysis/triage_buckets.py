@@ -411,7 +411,7 @@ def main() -> int:
     if args.force:
         # Every bucket with at least one finding is a candidate.
         import sqlite3
-        conn = sqlite3.connect(str(REPO_ROOT / "miscompilations" / "dedup.db"))
+        conn = sqlite3.connect(str(REPO_ROOT / "dedup.db"))
         try:
             buckets = [r[0] for r in conn.execute(
                 "SELECT bucket_id FROM buckets ORDER BY bucket_id"
@@ -421,7 +421,7 @@ def main() -> int:
     else:
         # Buckets with at least one untriaged finding.
         import sqlite3
-        conn = sqlite3.connect(str(REPO_ROOT / "miscompilations" / "dedup.db"))
+        conn = sqlite3.connect(str(REPO_ROOT / "dedup.db"))
         try:
             buckets = [r[0] for r in conn.execute(
                 "SELECT DISTINCT f.bucket_id FROM findings f "

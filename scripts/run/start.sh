@@ -2,30 +2,63 @@
 # Single entry point for the full fuzzing pipeline:
 #   Centipede fuzzer  +  alive-tv oracle  +  ASAN oracle
 #
+# Each invocation creates a new run directory under runs/<RUN_ID>/ and points
+# runs/current at it. All per-run state (workdir, corpus, run.log, oracle
+# results, miscompilations, triage, stats) lives under that directory.
+#
 # Usage:
-#   nohup ./scripts/run/start.sh > build/run.log 2>&1 &
-#   cat build/run_state/pids
+#   nohup ./scripts/run/start.sh [--seeds DIR] > /dev/null 2>&1 &
 #   ./scripts/run/stop.sh
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+source "$SCRIPT_DIR/run_helpers.sh"
 
-# ── State directory ──────────────────────────────────────────────────────────
+# ── Arg parsing ─────────────────────────────────────────────────────────────
 
-RUN_STATE="$BUILD_OUT/run_state"
-PIDS_FILE="$RUN_STATE/pids"
-RUN_LOG="$RUN_STATE/run.log"
+SEEDS_ARG=""
+while (( $# > 0 )); do
+    case "$1" in
+        --seeds)    SEEDS_ARG="${2:-}"; shift 2 ;;
+        --seeds=*)  SEEDS_ARG="${1#--seeds=}"; shift ;;
+        -h|--help)
+            sed -n '2,11p' "$0"
+            exit 0
+            ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+SEED_SOURCE="${SEEDS_ARG:-$SPLIT_SEEDS_DIR}"
+if [[ ! -d "$SEED_SOURCE" ]]; then
+    echo "ERROR: --seeds path does not exist: $SEED_SOURCE" >&2
+    exit 1
+fi
+if [[ -z "$(find "$SEED_SOURCE" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]]; then
+    echo "ERROR: --seeds path is empty: $SEED_SOURCE" >&2
+    exit 1
+fi
+
+# ── Initialize run directory ────────────────────────────────────────────────
+
+regatoni_init_run_dir "$SEED_SOURCE"
+RUN_DIR="$(regatoni_run_dir)"
+export RUN_DIR RUN_ID
+
+PIDS_FILE="$RUN_DIR/pids"
+RUN_LOG="$RUN_DIR/run.log"
 START_TIME="$(date +%s)"
 
-mkdir -p "$RUN_STATE"
 : > "$PIDS_FILE"
 : > "$RUN_LOG"
 
 log() { echo "[$(date -Is)] [start] $*" | tee -a "$RUN_LOG" >&2; }
 
-# ── Detect available cores (mirrors run_oracles.sh) ─────────────────────────
+log "RUN_ID=$RUN_ID  RUN_DIR=$RUN_DIR"
+
+# ── Detect available cores ──────────────────────────────────────────────────
 
 detect_cores() {
     local cpus=""
@@ -60,7 +93,6 @@ if (( ${#ALL_CORES[@]} < NEEDED )); then
     log "WARNING: only ${#ALL_CORES[@]} cores available (need $NEEDED); oracles may share cores"
 fi
 
-# Cores after the fuzzer's allocation are for oracles.
 ORACLE_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
 ASAN_CORE="${ORACLE_CORES[$ALIVE_SHARDS]:-${ALL_CORES[0]}}"
 
@@ -84,8 +116,6 @@ if (( err )); then
     exit 1
 fi
 
-# ── Record a PID ────────────────────────────────────────────────────────────
-
 record_pid() {
     local name="$1" pid="$2"
     echo "$name:$pid" >> "$PIDS_FILE"
@@ -94,28 +124,26 @@ record_pid() {
 # ── Summary ─────────────────────────────────────────────────────────────────
 
 print_summary() {
-    local now
+    local now elapsed h m s
     now="$(date +%s)"
-    local elapsed=$(( now - START_TIME ))
-    local h=$(( elapsed / 3600 ))
-    local m=$(( (elapsed % 3600) / 60 ))
-    local s=$(( elapsed % 60 ))
+    elapsed=$(( now - START_TIME ))
+    h=$(( elapsed / 3600 ))
+    m=$(( (elapsed % 3600) / 60 ))
+    s=$(( elapsed % 60 ))
 
     local corpus_count=0
-    if [[ -d "$CORPUS_DIR" ]]; then
-        corpus_count="$(find "$CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+    if [[ -d "$RUN_DIR/corpus" ]]; then
+        corpus_count="$(find "$RUN_DIR/corpus" -maxdepth 1 -type f 2>/dev/null | wc -l)"
     fi
 
     local crash_count=0
-    local workdir
-    workdir="$(ls -1dt "$BUILD_OUT"/workdir_*/crashes* 2>/dev/null | head -n1)"
-    if [[ -n "$workdir" ]]; then
-        crash_count="$(find "$workdir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+    if [[ -d "$RUN_DIR/workdir" ]]; then
+        crash_count="$(find "$RUN_DIR/workdir" -maxdepth 2 -type f -path '*/crashes*/*' 2>/dev/null | wc -l)"
     fi
 
     local miscomp_count=0
-    if [[ -d "$PROJECT_ROOT/miscompilations" ]]; then
-        miscomp_count="$(find "$PROJECT_ROOT/miscompilations" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+    if [[ -d "$RUN_DIR/miscompilations" ]]; then
+        miscomp_count="$(find "$RUN_DIR/miscompilations" -maxdepth 1 -type f 2>/dev/null | wc -l)"
     fi
 
     log "────────────────────────────────────────"
@@ -131,7 +159,6 @@ print_summary() {
 shutdown() {
     log "Shutting down..."
 
-    # Read PIDs from file (may have been written by this or another process).
     local pids=()
     if [[ -f "$PIDS_FILE" ]]; then
         while IFS=: read -r name pid; do
@@ -144,7 +171,6 @@ shutdown() {
         done < "$PIDS_FILE"
     fi
 
-    # Wait up to 5 seconds for graceful exit, then SIGKILL.
     if (( ${#pids[@]} > 0 )); then
         local deadline=$(( $(date +%s) + 5 ))
         for pid in "${pids[@]}"; do
@@ -159,26 +185,27 @@ shutdown() {
     fi
 
     print_summary
+    regatoni_finalize_run_dir "$RUN_ID"
     log "Stopped."
     exit 0
 }
 trap shutdown INT TERM
 
-# ── Start Centipede fuzzer ──────────────────────────────────────────────────
+# ── Set up workdir, corpus, env for child processes ─────────────────────────
 
-FUZZ_WORKDIR="$BUILD_OUT/workdir_$(date +%m%d%Y)"
-mkdir -p "$FUZZ_WORKDIR" "$CORPUS_DIR"
+FUZZ_WORKDIR="$RUN_DIR/workdir"
+CORPUS_DIR="$RUN_DIR/corpus"
+export CORPUS_DIR
 
 # Harness reads this to pick a directory for regatoni-mutation-stats.<pid>.csv.
-# Centipede propagates env vars into the runner subprocesses.
 export REGATONI_WORKDIR="$FUZZ_WORKDIR"
 
-# Copy seeds into corpus dir if empty
-if [[ -d "$SPLIT_SEEDS_DIR" ]] && [[ -z "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]]; then
-    log "Copying seeds into corpus dir..."
-    find "$SPLIT_SEEDS_DIR" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"
-    log "Copied $(find "$CORPUS_DIR" -maxdepth 1 -type f | wc -l) seed files"
-fi
+# Copy seeds from --seeds path into the per-run corpus dir.
+log "Copying seeds from $SEED_SOURCE into $CORPUS_DIR..."
+find "$SEED_SOURCE" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"
+log "Copied $(find "$CORPUS_DIR" -maxdepth 1 -type f | wc -l) seed files"
+
+# ── Centipede flags ─────────────────────────────────────────────────────────
 
 FUZZER_FLAGS=(
     --binary="$FUZZ_TARGET"
@@ -217,6 +244,15 @@ if [[ -n "${CALLSTACK_LEVEL:-}" ]] && (( CALLSTACK_LEVEL > 0 )); then
     FUZZER_FLAGS+=("--callstack_level=$CALLSTACK_LEVEL")
 fi
 
+# Stamp the constructed flag list into the manifest before launching.
+FLAGS_JSON="$(printf '%s\n' "${FUZZER_FLAGS[@]}" | python3 -c '
+import json, sys
+print(json.dumps([l.rstrip("\n") for l in sys.stdin]))
+')"
+regatoni_manifest_set centipede_flags "$FLAGS_JSON"
+
+# ── Start Centipede fuzzer ──────────────────────────────────────────────────
+
 log "Starting Centipede fuzzer (${FUZZER_CORES} jobs)..."
 ulimit -s unlimited
 "$CENTIPEDE_BIN" "${FUZZER_FLAGS[@]}" >> "$RUN_LOG" 2>&1 &
@@ -224,7 +260,6 @@ FUZZER_PID=$!
 record_pid "fuzzer" "$FUZZER_PID"
 log "Fuzzer PID: $FUZZER_PID"
 
-# Give the fuzzer a moment to initialize and populate the corpus dir.
 sleep 5
 
 if ! kill -0 "$FUZZER_PID" 2>/dev/null; then
@@ -262,8 +297,8 @@ if [[ -x "$PARSER" || -f "$PARSER" ]]; then
     log "Starting Centipede log parser daemon..."
     python3 "$PARSER" --watch \
         --log "$RUN_LOG" \
-        --workdir "$FUZZ_WORKDIR" \
-        --offset-file "$RUN_STATE/run.log.offset" \
+        --workdir "$RUN_DIR/stats" \
+        --offset-file "$RUN_DIR/run.log.offset" \
         >> "$RUN_LOG" 2>&1 &
     PARSER_PID=$!
     record_pid "log_parser" "$PARSER_PID"
@@ -284,16 +319,15 @@ for i in "${!ALIVE_PIDS[@]}"; do
 done
 log "  asan_opt    PID $ASAN_PID   core  $ASAN_CORE"
 log "───────────────────────────────────────────────"
+log "  run dir:    $RUN_DIR"
 log "  corpus:     $CORPUS_DIR"
 log "  workdir:    $FUZZ_WORKDIR"
-log "  miscomps:   $PROJECT_ROOT/miscompilations"
+log "  miscomps:   $RUN_DIR/miscompilations"
 log "  pids file:  $PIDS_FILE"
 log "  log:        $RUN_LOG"
 log "═══════════════════════════════════════════════"
 log ""
 log "Stop with:  ./scripts/run/stop.sh"
 log ""
-
-# ── Wait on all children ────────────────────────────────────────────────────
 
 wait
