@@ -102,5 +102,20 @@ log "─────────────────────────
 
 # Stamp end_time and clear runs/current. Run dir itself is preserved.
 regatoni_finalize_run_dir "$RUN_ID"
+
+# Final dashboard render: this is the snapshot that gets frozen at
+# <publish-dir>/runs/<run_id>.html since the manifest now has end_time.
+DASHBOARD="$SCRIPT_DIR/../analysis/render_dashboard.py"
+if [[ -f "$DASHBOARD" ]]; then
+    PUBLISH_ARGS=()
+    if [[ -n "${DASHBOARD_PUBLISH_DIR:-}" ]]; then
+        PUBLISH_ARGS=(--publish-to "$DASHBOARD_PUBLISH_DIR")
+    fi
+    python3 "$DASHBOARD" --run-dir "$RUN_DIR" --out "$RUN_DIR/dashboard.html" \
+        "${PUBLISH_ARGS[@]}" 2>>"$RUN_DIR/dashboard.log" \
+        && log "Final dashboard render written" \
+        || log "Final dashboard render failed (see $RUN_DIR/dashboard.log)"
+fi
+
 rm -f "$PIDS_FILE"
 log "Stopped run $RUN_ID."

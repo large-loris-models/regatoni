@@ -307,6 +307,36 @@ else
     log "WARNING: log parser not found at $PARSER — skipping"
 fi
 
+# ── Start dashboard regenerator daemon ──────────────────────────────────────
+
+DASHBOARD="$SCRIPT_DIR/../analysis/render_dashboard.py"
+DASHBOARD_PUBLISH_DIR="${DASHBOARD_PUBLISH_DIR:-}"
+DASHBOARD_HTTP_PORT="${DASHBOARD_HTTP_PORT:-8080}"
+if [[ -f "$DASHBOARD" ]]; then
+    log "Starting dashboard regenerator daemon..."
+    PUBLISH_ARGS=()
+    if [[ -n "$DASHBOARD_PUBLISH_DIR" ]]; then
+        PUBLISH_ARGS=(--publish-to "$DASHBOARD_PUBLISH_DIR")
+    fi
+    (while true; do
+        python3 "$DASHBOARD" --run-dir "$RUN_DIR" --out "$RUN_DIR/dashboard.html" \
+            "${PUBLISH_ARGS[@]}" \
+            2>>"$RUN_DIR/dashboard.log" || true
+        sleep 60
+    done) &
+    DASHBOARD_PID=$!
+    record_pid "dashboard" "$DASHBOARD_PID"
+    log "Dashboard daemon PID: $DASHBOARD_PID  (out: $RUN_DIR/dashboard.html)"
+    if [[ -n "$DASHBOARD_PUBLISH_DIR" ]]; then
+        DASH_HOST="$(hostname -f 2>/dev/null || hostname)"
+        log "═══════════════════════════════════════════════"
+        log "  Dashboard: http://${DASH_HOST}:${DASHBOARD_HTTP_PORT}/dashboard.html"
+        log "═══════════════════════════════════════════════"
+    fi
+else
+    log "WARNING: dashboard renderer not found at $DASHBOARD — skipping"
+fi
+
 # ── Status banner ───────────────────────────────────────────────────────────
 
 log ""
