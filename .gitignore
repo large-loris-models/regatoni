@@ -15,6 +15,7 @@ corpus/
 seeds/
 split_seeds/
 miscompilations/
+runs/
 
 # Python
 __pycache__/
