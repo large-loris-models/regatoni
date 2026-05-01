@@ -16,7 +16,11 @@ public:
 
   // Pick a random applicable mutation and apply it.
   // Returns the name of the mutation applied, or "" if none applied.
-  std::string applyRandom(llvm::Module &M, std::mt19937 &rng);
+  // If selected_idx_out is non-null, it receives the registry index of the
+  // mutator that was *selected* (regardless of whether apply succeeded), or
+  // -1 if no mutator was applicable.
+  std::string applyRandom(llvm::Module &M, std::mt19937 &rng,
+                          int *selected_idx_out = nullptr);
 
   // Get all registered mutations
   const std::vector<std::unique_ptr<Mutation>> &all() const { return mutations_; }

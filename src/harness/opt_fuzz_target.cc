@@ -23,13 +23,18 @@
 
 #include "src/mutators/registry.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
+#include <unistd.h>
 
 static llvm::LLVMContext *Ctx = nullptr;
 static std::mt19937 *RNG = nullptr;
@@ -41,13 +46,124 @@ static constexpr const char *kDefaultTripleStr = "x86_64-unknown-linux-gnu";
 // reuse is safe.
 static llvm::TargetMachine *g_default_tm = nullptr;
 
-// Centipede user-defined features: domain 0, feature id = mutation index + 1.
-// Zero is ignored by Centipede, so we reserve it for "no mutation".
+// Centipede user-defined features. Each input that came from a mutator writes
+// into slot (mutation_id - 1) so that Centipede attributes the user feature to
+// kUserDomains[mutation_id - 1] — one domain per mutator. The lower 32 bits
+// carry a per-input hash so distinct inputs from the same mutator count as
+// distinct user features in that mutator's domain.
 static constexpr size_t kNumExtraFeatures = 64;
 __attribute__((used, retain, section("__centipede_extra_features")))
 static uint64_t regatoni_extra_features[kNumExtraFeatures];
 
 static thread_local uint32_t g_last_mutation_id = 0;
+
+// ── Per-mutator harness counters (Feed 1) ───────────────────────────────────
+// Layout: g_mutation_stats[mutator_index_0_based][stat_field].
+// Mutator IDs are 1-indexed at the boundary; we store 0-indexed internally.
+namespace {
+constexpr size_t kNumMutators = 14;
+enum StatField : size_t {
+  kAttempted = 0,
+  kApplied = 1,
+  kParseFail = 2,
+  kVerifyFail = 3,
+  kTooLarge = 4,
+  kSuccess = 5,
+  kNumStatFields = 6,
+};
+}  // namespace
+static std::atomic<uint64_t> g_mutation_stats[kNumMutators][kNumStatFields];
+static std::atomic<uint64_t> g_inputs_since_flush{0};
+static uint64_t g_flush_every = 1000;
+static std::string g_stats_path;
+
+static uint32_t fnv1a32(const uint8_t *data, size_t size) {
+  uint32_t h = 0x811C9DC5u;
+  for (size_t i = 0; i < size; ++i) {
+    h ^= data[i];
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
+static uint64_t now_unix_micros() {
+  using namespace std::chrono;
+  return duration_cast<microseconds>(
+             system_clock::now().time_since_epoch())
+      .count();
+}
+
+static void initMutationStats() {
+  const char *workdir = getenv("REGATONI_WORKDIR");
+  std::string base;
+  if (workdir && *workdir) {
+    base = workdir;
+  } else {
+    fprintf(stderr,
+            "REGATONI_WORKDIR not set; writing mutation stats CSV in cwd\n");
+    base = ".";
+  }
+  std::ostringstream os;
+  os << base << "/regatoni-mutation-stats." << getpid() << ".csv";
+  g_stats_path = os.str();
+
+  if (FILE *f = fopen(g_stats_path.c_str(), "w")) {
+    fprintf(f,
+            "unix_micros,mutator_id,mutator_name,attempted,applied,"
+            "parse_fail,verify_fail,too_large,success\n");
+    fclose(f);
+  } else {
+    fprintf(stderr, "Failed to open mutation stats file: %s\n",
+            g_stats_path.c_str());
+    g_stats_path.clear();
+  }
+
+  if (const char *e = getenv("REGATONI_MUTATION_FLUSH_EVERY")) {
+    char *end = nullptr;
+    unsigned long v = strtoul(e, &end, 10);
+    if (v > 0) g_flush_every = v;
+  }
+}
+
+static void flushMutationStats() {
+  if (g_stats_path.empty()) return;
+  FILE *f = fopen(g_stats_path.c_str(), "a");
+  if (!f) return;
+  uint64_t ts = now_unix_micros();
+  const auto &all = regatoni::MutationRegistry::instance().all();
+  for (size_t i = 0; i < kNumMutators; ++i) {
+    std::string name = (i < all.size()) ? all[i]->name() : std::string();
+    fprintf(f, "%llu,%zu,%s,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            (unsigned long long)ts, i + 1, name.c_str(),
+            (unsigned long long)g_mutation_stats[i][kAttempted].load(
+                std::memory_order_relaxed),
+            (unsigned long long)g_mutation_stats[i][kApplied].load(
+                std::memory_order_relaxed),
+            (unsigned long long)g_mutation_stats[i][kParseFail].load(
+                std::memory_order_relaxed),
+            (unsigned long long)g_mutation_stats[i][kVerifyFail].load(
+                std::memory_order_relaxed),
+            (unsigned long long)g_mutation_stats[i][kTooLarge].load(
+                std::memory_order_relaxed),
+            (unsigned long long)g_mutation_stats[i][kSuccess].load(
+                std::memory_order_relaxed));
+  }
+  fclose(f);
+}
+
+static void bumpStat(uint32_t mutation_id_1_based, StatField field) {
+  if (mutation_id_1_based == 0 || mutation_id_1_based > kNumMutators) return;
+  g_mutation_stats[mutation_id_1_based - 1][field].fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+static void maybeFlushMutationStats() {
+  uint64_t cur = g_inputs_since_flush.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (cur >= g_flush_every) {
+    g_inputs_since_flush.store(0, std::memory_order_relaxed);
+    flushMutationStats();
+  }
+}
 
 extern "C" size_t LLVMFuzzerMutate(uint8_t *Data, size_t Size, size_t MaxSize);
 
@@ -110,10 +226,16 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   }
 
   (void)regatoni::MutationRegistry::instance();
+  initMutationStats();
   return 0;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+  uint32_t mid = g_last_mutation_id;
+  g_last_mutation_id = 0;
+  // Flush cadence is "every N inputs" — count *all* inputs, mutated or not.
+  maybeFlushMutationStats();
+
   if (Size == 0)
     return 0;
 
@@ -123,8 +245,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
       "fuzz_input");
 
   auto M = llvm::parseIR(*Buf, Err, *Ctx);
-  if (!M)
+  if (!M) {
+    if (mid != 0) bumpStat(mid, kParseFail);
     return 0;
+  }
+
+  if (mid != 0 && llvm::verifyModule(*M, nullptr)) {
+    bumpStat(mid, kVerifyFail);
+    return 0;
+  }
 
   llvm::StripDebugInfo(*M);
 
@@ -153,11 +282,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 
   MPM.run(*M, MAM);
 
-  // Upper 32 bits = domain id (0); lower 32 bits = mutation index + 1.
-  if (g_last_mutation_id != 0) {
-    regatoni_extra_features[0] =
-        (uint64_t{0} << 32) | uint64_t{g_last_mutation_id};
-    g_last_mutation_id = 0;
+  // Per-mutator user-feature: high 32 bits = domain id (mid - 1), low 32 bits
+  // = per-input hash so distinct inputs from the same mutator are distinct
+  // user features inside that mutator's domain.
+  if (mid != 0) {
+    uint32_t slot = mid - 1;
+    if (slot < kNumExtraFeatures) {
+      regatoni_extra_features[slot] =
+          (uint64_t{slot} << 32) | uint64_t{fnv1a32(Data, Size)};
+    }
+    bumpStat(mid, kSuccess);
   }
   return 0;
 }
@@ -181,22 +315,24 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
 
   std::mt19937 rng(Seed);
   auto &reg = regatoni::MutationRegistry::instance();
-  std::string applied = reg.applyRandom(*M, rng);
+  int selected_idx = -1;
+  std::string applied = reg.applyRandom(*M, rng, &selected_idx);
+
+  // Attribute the attempt to the selected mutator (if any was applicable),
+  // even when apply() itself returned false.
+  uint32_t mutation_id =
+      (selected_idx >= 0) ? static_cast<uint32_t>(selected_idx) + 1 : 0;
+  if (mutation_id != 0) bumpStat(mutation_id, kAttempted);
+
   if (applied.empty())
     return LLVMFuzzerMutate(Data, Size, MaxSize);
 
-  if (llvm::verifyModule(*M, nullptr))
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+  bumpStat(mutation_id, kApplied);
 
-  uint32_t mutation_id = 0;
-  const auto &all = reg.all();
-  for (size_t i = 0; i < all.size(); ++i) {
-    if (all[i]->name() == applied) {
-      mutation_id = static_cast<uint32_t>(i) + 1;
-      break;
-    }
+  if (llvm::verifyModule(*M, nullptr)) {
+    bumpStat(mutation_id, kVerifyFail);
+    return LLVMFuzzerMutate(Data, Size, MaxSize);
   }
-  g_last_mutation_id = mutation_id;
 
   std::string Out;
   Out.reserve(Size + applied.size() + 32);
@@ -207,9 +343,12 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   M->print(OS, nullptr);
   OS.flush();
 
-  if (Out.size() > MaxSize)
+  if (Out.size() > MaxSize) {
+    bumpStat(mutation_id, kTooLarge);
     return LLVMFuzzerMutate(Data, Size, MaxSize);
+  }
 
+  g_last_mutation_id = mutation_id;
   std::memcpy(Data, Out.data(), Out.size());
   return Out.size();
 }
