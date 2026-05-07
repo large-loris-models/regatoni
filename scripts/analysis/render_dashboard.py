@@ -179,6 +179,47 @@ def load_mutation_stats(run_dir: Path) -> list:
     return out
 
 
+def load_fallback_stats(run_dir: Path) -> list:
+    """Aggregate fallback-site counters across PIDs.
+
+    Per-PID file is append-only with periodic snapshots of cumulative counts.
+    Take the last row per (PID, site_id), sum across PIDs.
+    """
+    candidates = glob.glob(
+        str(run_dir / "workdir" / "regatoni-fallback-stats.*.csv")
+    ) + glob.glob(str(run_dir / "stats" / "fallback-stats.*.csv"))
+    if not candidates:
+        return []
+
+    by_site = {}
+    for path in candidates:
+        try:
+            with open(path) as f:
+                reader = csv.DictReader(f)
+                latest_per_site = {}
+                for row in reader:
+                    try:
+                        sid = int(row["site_id"])
+                    except (KeyError, ValueError):
+                        continue
+                    latest_per_site[sid] = row
+            for sid, row in latest_per_site.items():
+                acc = by_site.setdefault(
+                    sid,
+                    {"id": sid, "name": row.get("site_name", "?"), "count": 0},
+                )
+                try:
+                    acc["count"] += int(row.get("count", 0) or 0)
+                except ValueError:
+                    pass
+        except OSError:
+            continue
+
+    out = list(by_site.values())
+    out.sort(key=lambda r: r["id"])
+    return out
+
+
 def load_dedup(db_path: Path, run_id: str):
     """Returns (top_buckets, recent_findings). Empty lists if db unavailable
     or run_id is None."""
@@ -479,6 +520,42 @@ def render_mutator_table(rows) -> str:
     )
 
 
+def render_fallback_table(rows) -> str:
+    if not rows:
+        return _empty_section(
+            "fallbacks",
+            "Fallback sites",
+            "no data yet (no regatoni-fallback-stats.*.csv files found)",
+        )
+    total = sum(r["count"] for r in rows)
+    head = (
+        "<tr><th>id</th><th>site</th>"
+        "<th class='num'>count</th><th class='num'>share</th></tr>"
+    )
+    body = []
+    for r in rows:
+        share = (r["count"] / total) if total else 0.0
+        share_s = f"{share * 100:.2f}%" if total else "—"
+        body.append(
+            f"<tr><td>{r['id']}</td>"
+            f"<td>{html.escape(r['name'])}</td>"
+            f"<td class='num'>{r['count']:,}</td>"
+            f"<td class='num'>{share_s}</td></tr>"
+        )
+    body.append(
+        f"<tr><td></td><td><b>total</b></td>"
+        f"<td class='num'><b>{total:,}</b></td><td class='num'></td></tr>"
+    )
+    return (
+        '<section class="block"><h2>Fallback sites</h2>'
+        "<p style='font-size:12px;color:#666;margin:0 0 6px 0;'>"
+        "Number of times LLVMFuzzerCustomMutator fell through to the "
+        "byte-level fallback path, by site.</p>"
+        f"<table class='data'><thead>{head}</thead>"
+        f"<tbody>{''.join(body)}</tbody></table></section>"
+    )
+
+
 def render_buckets_table(buckets) -> str:
     if not buckets:
         return _empty_section(
@@ -601,6 +678,7 @@ def render_html(run_dir: Path, db_path: Path) -> str:
     fuzzing_rows = load_fuzzing_stats(run_dir)
     batch_rows = load_batch_stats(run_dir)
     mutators = load_mutation_stats(run_dir)
+    fallbacks = load_fallback_stats(run_dir)
     buckets, findings = load_dedup(db_path, run_id)
 
     # Miscomps registered with this run_id: count via sqlite directly.
@@ -628,6 +706,7 @@ def render_html(run_dir: Path, db_path: Path) -> str:
         render_coverage_plot(fuzzing_rows),
         render_exec_plot(batch_rows),
         render_mutator_table(mutators),
+        render_fallback_table(fallbacks),
         render_buckets_table(buckets),
         render_findings_table(findings),
         f'<div class="footer">rendered {html.escape(fmt_iso(now_ts))} '

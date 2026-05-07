@@ -2,7 +2,12 @@
 //
 // LLVMFuzzerTestOneInput: parse bytes as LLVM IR, run opt O2. Crash = bug.
 // LLVMFuzzerCustomMutator: parse, apply a random mutation from our registry,
-// serialize. Falls back to libFuzzer's mutator on failure.
+// serialize. Returns 0 on any failure — Centipede's runner treats 0 as "no
+// mutation produced" and skips that attempt (third_party/fuzztest/centipede/
+// runner.cc:670). The byte-level libFuzzer fallback was disabled
+// 2026-05-04 — see docs/decisions/2026-05-04_byte_level_disabled.md. Each
+// fallback site is still counted in g_fallback_counters so we can measure
+// how often we return 0.
 
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/DebugInfo.h"
@@ -77,6 +82,33 @@ static std::atomic<uint64_t> g_inputs_since_flush{0};
 static uint64_t g_flush_every = 1000;
 static std::string g_stats_path;
 
+// ── Fallback-site counters ──────────────────────────────────────────────────
+// Aggregate (not per-mutator). Increments every time LLVMFuzzerCustomMutator
+// returns 0 ("no mutation produced"). Sites split naturally on the
+// (selected_idx, applied) values returned by registry::applyRandom.
+namespace {
+enum FallbackSite : size_t {
+  kFallbackEmptyInput = 0,
+  kFallbackParseFail = 1,
+  kFallbackNoneApplicable = 2,  // applyRandom: applicable set was empty
+  kFallbackApplyFailed = 3,     // applyRandom: chosen apply() returned false
+  kFallbackVerifyFail = 4,
+  kFallbackTooLarge = 5,
+  kFallbackSiteCount = 6,
+};
+}  // namespace
+static std::atomic<uint64_t> g_fallback_counters[kFallbackSiteCount];
+static const char *kFallbackSiteNames[kFallbackSiteCount] = {
+    "fallback_empty_input",     "fallback_parse_fail",
+    "fallback_none_applicable", "fallback_apply_failed",
+    "fallback_verify_fail",     "fallback_too_large",
+};
+static std::string g_fallback_stats_path;
+
+static void bumpFallback(FallbackSite site) {
+  g_fallback_counters[site].fetch_add(1, std::memory_order_relaxed);
+}
+
 static uint32_t fnv1a32(const uint8_t *data, size_t size) {
   uint32_t h = 0x811C9DC5u;
   for (size_t i = 0; i < size; ++i) {
@@ -118,6 +150,18 @@ static void initMutationStats() {
     g_stats_path.clear();
   }
 
+  std::ostringstream fos;
+  fos << base << "/regatoni-fallback-stats." << getpid() << ".csv";
+  g_fallback_stats_path = fos.str();
+  if (FILE *f = fopen(g_fallback_stats_path.c_str(), "w")) {
+    fprintf(f, "unix_micros,site_id,site_name,count\n");
+    fclose(f);
+  } else {
+    fprintf(stderr, "Failed to open fallback stats file: %s\n",
+            g_fallback_stats_path.c_str());
+    g_fallback_stats_path.clear();
+  }
+
   if (const char *e = getenv("REGATONI_MUTATION_FLUSH_EVERY")) {
     char *end = nullptr;
     unsigned long v = strtoul(e, &end, 10);
@@ -126,29 +170,41 @@ static void initMutationStats() {
 }
 
 static void flushMutationStats() {
-  if (g_stats_path.empty()) return;
-  FILE *f = fopen(g_stats_path.c_str(), "a");
-  if (!f) return;
   uint64_t ts = now_unix_micros();
-  const auto &all = regatoni::MutationRegistry::instance().all();
-  for (size_t i = 0; i < kNumMutators; ++i) {
-    std::string name = (i < all.size()) ? all[i]->name() : std::string();
-    fprintf(f, "%llu,%zu,%s,%llu,%llu,%llu,%llu,%llu,%llu\n",
-            (unsigned long long)ts, i + 1, name.c_str(),
-            (unsigned long long)g_mutation_stats[i][kAttempted].load(
-                std::memory_order_relaxed),
-            (unsigned long long)g_mutation_stats[i][kApplied].load(
-                std::memory_order_relaxed),
-            (unsigned long long)g_mutation_stats[i][kParseFail].load(
-                std::memory_order_relaxed),
-            (unsigned long long)g_mutation_stats[i][kVerifyFail].load(
-                std::memory_order_relaxed),
-            (unsigned long long)g_mutation_stats[i][kTooLarge].load(
-                std::memory_order_relaxed),
-            (unsigned long long)g_mutation_stats[i][kSuccess].load(
-                std::memory_order_relaxed));
+  if (!g_stats_path.empty()) {
+    if (FILE *f = fopen(g_stats_path.c_str(), "a")) {
+      const auto &all = regatoni::MutationRegistry::instance().all();
+      for (size_t i = 0; i < kNumMutators; ++i) {
+        std::string name = (i < all.size()) ? all[i]->name() : std::string();
+        fprintf(f, "%llu,%zu,%s,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                (unsigned long long)ts, i + 1, name.c_str(),
+                (unsigned long long)g_mutation_stats[i][kAttempted].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_mutation_stats[i][kApplied].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_mutation_stats[i][kParseFail].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_mutation_stats[i][kVerifyFail].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_mutation_stats[i][kTooLarge].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_mutation_stats[i][kSuccess].load(
+                    std::memory_order_relaxed));
+      }
+      fclose(f);
+    }
   }
-  fclose(f);
+  if (!g_fallback_stats_path.empty()) {
+    if (FILE *f = fopen(g_fallback_stats_path.c_str(), "a")) {
+      for (size_t i = 0; i < kFallbackSiteCount; ++i) {
+        fprintf(f, "%llu,%zu,%s,%llu\n", (unsigned long long)ts, i,
+                kFallbackSiteNames[i],
+                (unsigned long long)g_fallback_counters[i].load(
+                    std::memory_order_relaxed));
+      }
+      fclose(f);
+    }
+  }
 }
 
 static void bumpStat(uint32_t mutation_id_1_based, StatField field) {
@@ -164,8 +220,6 @@ static void maybeFlushMutationStats() {
     flushMutationStats();
   }
 }
-
-extern "C" size_t LLVMFuzzerMutate(uint8_t *Data, size_t Size, size_t MaxSize);
 
 static std::unique_ptr<llvm::TargetMachine>
 buildTargetMachine(const llvm::Triple &T) {
@@ -299,8 +353,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
                                           size_t MaxSize, unsigned int Seed) {
 
-  if (Size == 0)
-     return LLVMFuzzerMutate(Data, Size, MaxSize);
+  if (Size == 0) {
+    bumpFallback(kFallbackEmptyInput);
+    return 0;
+  }
 
   llvm::SMDiagnostic Err;
   auto Buf = llvm::MemoryBuffer::getMemBufferCopy(
@@ -308,8 +364,10 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
       "fuzz_input");
 
   auto M = llvm::parseIR(*Buf, Err, *Ctx);
-  if (!M)
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+  if (!M) {
+    bumpFallback(kFallbackParseFail);
+    return 0;
+  }
 
   llvm::StripDebugInfo(*M);
 
@@ -324,14 +382,20 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
       (selected_idx >= 0) ? static_cast<uint32_t>(selected_idx) + 1 : 0;
   if (mutation_id != 0) bumpStat(mutation_id, kAttempted);
 
-  if (applied.empty())
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+  if (applied.empty()) {
+    // selected_idx == -1 ⇒ no mutator's canApply() returned true.
+    // selected_idx >=  0 ⇒ chosen mutator's apply() returned false.
+    bumpFallback(selected_idx < 0 ? kFallbackNoneApplicable
+                                  : kFallbackApplyFailed);
+    return 0;
+  }
 
   bumpStat(mutation_id, kApplied);
 
   if (llvm::verifyModule(*M, nullptr)) {
     bumpStat(mutation_id, kVerifyFail);
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    bumpFallback(kFallbackVerifyFail);
+    return 0;
   }
 
   std::string Out;
@@ -345,7 +409,8 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
 
   if (Out.size() > MaxSize) {
     bumpStat(mutation_id, kTooLarge);
-    return LLVMFuzzerMutate(Data, Size, MaxSize);
+    bumpFallback(kFallbackTooLarge);
+    return 0;
   }
 
   g_last_mutation_id = mutation_id;
