@@ -46,3 +46,6 @@ CLAUDE.md
 # (TEMP) Add some debug related dirs
 /docs/
 /triage/
+/experiments/
+FUZZER_MAP.md
+dedup.db*
