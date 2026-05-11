@@ -26,6 +26,7 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include "src/mutators/corpus_index.h"
 #include "src/mutators/registry.h"
 
 #include <atomic>
@@ -281,6 +282,12 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
 
   (void)regatoni::MutationRegistry::instance();
   initMutationStats();
+
+  // Build cross-corpus splicing index for the inline_call mutator.
+  const char *idx_dir_env = getenv("REGATONI_CORPUS_INDEX_DIR");
+  std::string idx_dir =
+      (idx_dir_env && *idx_dir_env) ? idx_dir_env : "split_seeds";
+  regatoni::CorpusIndex::instance().build(idx_dir);
   return 0;
 }
 
