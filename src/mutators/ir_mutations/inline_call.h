@@ -6,8 +6,10 @@
 
 namespace regatoni {
 
-// Picks a random direct call site whose callee is a function with a
-// body and inlines it via llvm::InlineFunction.
+// Picks a random direct call site whose callee is a function declaration with
+// a signature match in the corpus library (see CorpusIndex). Splices a
+// matching corpus function body into the declaration, sets it internal, and
+// inlines the call via llvm::InlineFunction.
 class InlineCall : public Mutation {
 public:
   std::string name() const override { return "inline_call"; }
