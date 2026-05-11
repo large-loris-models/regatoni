@@ -200,6 +200,10 @@ export CORPUS_DIR
 # Harness reads this to pick a directory for regatoni-mutation-stats.<pid>.csv.
 export REGATONI_WORKDIR="$FUZZ_WORKDIR"
 
+# Harness reads this to build the cross-corpus inline_call splicing index.
+# Defaults to split_seeds/ if unset; we point it at whatever --seeds resolved to.
+export REGATONI_CORPUS_INDEX_DIR="$SEED_SOURCE"
+
 # Copy seeds from --seeds path into the per-run corpus dir.
 log "Copying seeds from $SEED_SOURCE into $CORPUS_DIR..."
 find "$SEED_SOURCE" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"

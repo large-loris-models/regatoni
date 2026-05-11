@@ -27,6 +27,7 @@ mkdir -p "$BUILD_OUT"
 # Mutation framework sources (shared with tests)
 MUTATOR_SRCS=(
     "$PROJECT_ROOT/src/mutators/registry.cc"
+    "$PROJECT_ROOT/src/mutators/corpus_index.cc"
     "$PROJECT_ROOT/src/mutators/ir_mutations/swap_binop.cc"
     "$PROJECT_ROOT/src/mutators/ir_mutations/swap_cmp_predicate.cc"
     "$PROJECT_ROOT/src/mutators/ir_mutations/modify_flags.cc"
