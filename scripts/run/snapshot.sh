@@ -9,8 +9,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
 
-PIDS_FILE="$BUILD_OUT/run_state/pids"
-TRENDS_CSV="$BUILD_OUT/coverage_trends.csv"
+# ── Locate active run dir ───────────────────────────────────────────────────
+
+RUN_DIR="${RUN_DIR:-}"
+if [[ -z "$RUN_DIR" ]]; then
+    if [[ -L "$PROJECT_ROOT/runs/current" ]]; then
+        RUN_DIR="$(realpath "$PROJECT_ROOT/runs/current")"
+    fi
+fi
+if [[ -z "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
+    echo "[$(date -Is)] [snapshot] ERROR: no active run (runs/current not found) — is the fuzzer running? (start with scripts/run/start.sh)" >&2
+    exit 1
+fi
+
+PIDS_FILE="$RUN_DIR/pids"
+WORKDIR="$RUN_DIR/workdir"
+TRENDS_CSV="$RUN_DIR/coverage_trends.csv"
 
 log() { echo "[$(date -Is)] [snapshot] $*" >&2; }
 
@@ -31,11 +45,10 @@ if ! kill -0 "$FUZZER_PID" 2>/dev/null; then
     exit 1
 fi
 
-# ── Locate current workdir ──────────────────────────────────────────────────
+# ── Validate workdir ────────────────────────────────────────────────────────
 
-WORKDIR="$(ls -1dt "$BUILD_OUT"/workdir_* 2>/dev/null | head -n1)"
-if [[ -z "$WORKDIR" || ! -d "$WORKDIR" ]]; then
-    log "ERROR: no workdir found under $BUILD_OUT/workdir_*"
+if [[ ! -d "$WORKDIR" ]]; then
+    log "ERROR: workdir not found at $WORKDIR"
     exit 1
 fi
 
@@ -52,10 +65,10 @@ kill -USR1 "$FUZZER_PID"
 #
 # Centipede only dumps telemetry between batches, so the new report can take
 # a few seconds to appear depending on batch_size / exec speed. We poll for up
-# to ~60s.
+# to ~180s.
 
 NEW_REPORT=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 180); do
     sleep 1
     CANDIDATE="$(ls -1t "$WORKDIR"/coverage-report-*.snapshot_*.txt 2>/dev/null | head -n1 || true)"
     if [[ -n "$CANDIDATE" && "$CANDIDATE" != "$PREV_REPORT" ]]; then
@@ -65,7 +78,7 @@ for _ in $(seq 1 60); do
 done
 
 if [[ -z "$NEW_REPORT" ]]; then
-    log "ERROR: no new snapshot report appeared within 60s (workdir=$WORKDIR)"
+    log "ERROR: no new snapshot report appeared within 180s (workdir=$WORKDIR)"
     exit 1
 fi
 

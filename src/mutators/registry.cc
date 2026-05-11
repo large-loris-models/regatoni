@@ -19,7 +19,6 @@
 // #include "src/mutators/alive_mutations/modify_flags.h"
 
 #include <algorithm>
-#include <cstdio>
 
 namespace regatoni {
 
@@ -27,22 +26,32 @@ void MutationRegistry::add(std::unique_ptr<Mutation> m) {
   mutations_.push_back(std::move(m));
 }
 
-std::string MutationRegistry::applyRandom(llvm::Module &M, std::mt19937 &rng) {
+std::string MutationRegistry::applyRandom(llvm::Module &M, std::mt19937 &rng,
+                                          int *selected_idx_out) {
   // Collect applicable mutations
   std::vector<Mutation *> applicable;
   for (auto &m : mutations_)
     if (m->canApply(M))
       applicable.push_back(m.get());
 
-  if (applicable.empty())
+  if (applicable.empty()) {
+    if (selected_idx_out) *selected_idx_out = -1;
     return "";
+  }
 
   // Equal weight for now — pick uniformly at random
   std::uniform_int_distribution<size_t> dist(0, applicable.size() - 1);
   auto *chosen = applicable[dist(rng)];
 
-  fprintf(stderr, "applyRandom: chose mutation: %s\n", chosen->name().c_str());
-  fflush(stderr);
+  if (selected_idx_out) {
+    *selected_idx_out = -1;
+    for (size_t i = 0; i < mutations_.size(); ++i) {
+      if (mutations_[i].get() == chosen) {
+        *selected_idx_out = static_cast<int>(i);
+        break;
+      }
+    }
+  }
 
   if (chosen->apply(M, rng))
     return chosen->name();

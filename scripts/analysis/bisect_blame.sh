@@ -1,33 +1,52 @@
 #!/usr/bin/env bash
-# bisect_blame.sh — feasibility experiment for opt-bisect-limit dedup.
+# bisect_blame.sh — find the guilty pass for a miscompilation witness via
+# binary search on -opt-bisect-limit, validated by alive-tv against the
+# unoptimized input.
 #
-# Binary-searches over -opt-bisect-limit on the same pipeline alive2 harness
-# uses (PassBuilder::buildPerModuleDefaultPipeline(O2), no custom PTO; see
-# deps/alive2/llvm_util/llvm_optimizer.cpp). Finds the smallest N such that
-# alive-tv reports the limit-N opt output as unsound vs the input.
+# Pipeline matches the alive2 harness: PassBuilder::buildPerModuleDefaultPipeline(O2)
+# with default PipelineTuningOptions (default<O2>). Tools come from env.sh
+# so this uses the plain (uninstrumented) opt and the project's alive-tv.
 #
-# Outputs one TSV row to stdout:
+# Output (one TSV row to stdout):
 #   <file>\t<guilty_pass>\t<bisect_index>\t<elapsed_seconds>
 #   <file>\tFAIL\t<reason>\t<elapsed_seconds>
+#
+# Usage: bisect_blame.sh [--quiet] <ir_file>
+#   --quiet  suppress the bisect-progress log on stderr (TSV row still on stdout)
 
 set -u
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-OPT="${REPO_ROOT}/deps/llvm-build-plain/bin/opt"
-ALIVE_TV="${REPO_ROOT}/deps/alive2/build/alive-tv"
-PIPELINE='default<O2>'
-
-PER_OPT_TIMEOUT=30
-PER_ALIVE_TIMEOUT=30
-WHOLE_BISECT_DEADLINE=300   # 5 min
+QUIET=0
+if [[ "${1:-}" == "--quiet" ]]; then
+    QUIET=1
+    shift
+fi
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <ir_file>" >&2
+    echo "usage: $0 [--quiet] <ir_file>" >&2
     exit 2
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# env.sh uses set -euo pipefail; isolate that from this script's set -u.
+source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+set +e
+set -u
+
+OPT="$LLVM_BUILD_PLAIN/bin/opt"
+# ALIVE_TV is exported by env.sh.
+PIPELINE='default<O2>'
+
+PER_OPT_TIMEOUT="${PER_OPT_TIMEOUT:-30}"
+PER_ALIVE_TIMEOUT="${PER_ALIVE_TIMEOUT:-30}"
+WHOLE_BISECT_DEADLINE="${WHOLE_BISECT_DEADLINE:-300}"
+
 INPUT="$1"
 START=$SECONDS
+
+log() {
+    (( QUIET )) || echo "$@" >&2
+}
 
 emit_fail() {
     local reason="$1"
@@ -55,25 +74,22 @@ MAX_N=$(grep -c '^BISECT: running pass' "$WORK/full.log" || true)
 if [[ -z "$MAX_N" || "$MAX_N" -lt 1 ]]; then
     emit_fail "no_passes_in_pipeline"
 fi
+log "[bisect] $INPUT: MAX_N=$MAX_N"
 
-# Sanity: confirm the file actually miscompiles under the full pipeline.
 run_opt() {
-    local limit="$1" out="$2" log="$3"
+    local limit="$1" out="$2" log_path="$3"
     timeout "$PER_OPT_TIMEOUT" "$OPT" -opt-bisect-limit="$limit" \
-        -passes="$PIPELINE" "$INPUT" -S -o "$out" 2>"$log"
+        -passes="$PIPELINE" "$INPUT" -S -o "$out" 2>"$log_path"
 }
 
 # Returns 0 (sound) / 1 (unsound) / 2 (inconclusive).
 check_sound() {
     local opt_out="$1"
-    local alive_log
-    alive_log="$WORK/alive.log"
+    local alive_log="$WORK/alive.log"
     if ! timeout "$PER_ALIVE_TIMEOUT" "$ALIVE_TV" "$INPUT" "$opt_out" \
             >"$alive_log" 2>&1; then
-        # Treat alive-tv timeout/crash as inconclusive.
         return 2
     fi
-    # Parse the trailing summary block.
     local incorrect
     incorrect=$(awk '/incorrect transformations/ {print $1}' "$alive_log" \
                 | tail -1)
@@ -86,7 +102,7 @@ check_sound() {
     return 0
 }
 
-# Confirm hi=MAX_N is unsound and lo=0 is sound. Bail out otherwise.
+# Confirm hi=MAX_N is unsound and lo=0 is sound.
 if ! run_opt "$MAX_N" "$WORK/hi.ll" "$WORK/hi.log"; then
     emit_fail "opt_hi_failed"
 fi
@@ -106,33 +122,29 @@ lo_status=$?
 if (( lo_status == 1 )); then
     emit_fail "limit0_already_unsound"
 fi
-# lo_status == 2 is allowed; we keep lo=0 anyway (no passes run).
 
 # Invariant: f(lo)=sound, f(hi)=unsound. Find smallest N in (lo, hi] with
-# f(N)=unsound. Inconclusive points are treated as sound (push toward hi)
-# so that the result we report has a *definite* unsound boundary.
+# f(N)=unsound. Inconclusive points get pushed toward hi so the reported
+# guilty index has a *definite* unsound boundary.
 LO=0
 HI=$MAX_N
-ITERATIONS=0
 while (( LO + 1 < HI )); do
     deadline_check
-    ITERATIONS=$(( ITERATIONS + 1 ))
     MID=$(( (LO + HI) / 2 ))
     if ! run_opt "$MID" "$WORK/mid.ll" "$WORK/mid.log"; then
-        # opt itself failed at this limit — treat as inconclusive, push to hi.
         LO=$MID
+        log "[bisect] mid=$MID opt_failed lo=$LO hi=$HI"
         continue
     fi
     check_sound "$WORK/mid.ll"
     case $? in
-        0) LO=$MID ;;       # sound → guilty index is > MID
-        1) HI=$MID ;;       # unsound → guilty index is ≤ MID
-        2) LO=$MID ;;       # inconclusive → conservative push
+        0) LO=$MID; log "[bisect] mid=$MID sound       lo=$LO hi=$HI" ;;
+        1) HI=$MID; log "[bisect] mid=$MID unsound     lo=$LO hi=$HI" ;;
+        2) LO=$MID; log "[bisect] mid=$MID inconcl     lo=$LO hi=$HI" ;;
     esac
 done
 
 GUILTY_INDEX=$HI
-# Re-run hi to extract the pass name at that index from BISECT log.
 if ! run_opt "$GUILTY_INDEX" "$WORK/g.ll" "$WORK/g.log"; then
     emit_fail "opt_at_guilty_failed"
 fi

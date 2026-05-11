@@ -8,12 +8,14 @@ deps/
 # Environment
 .env
 regatoni.local.conf
+.claude
 
 # Corpus runtime data (seeds checked in separately)
 corpus/
 seeds/
 split_seeds/
 miscompilations/
+runs/
 
 # Python
 __pycache__/
@@ -44,3 +46,6 @@ CLAUDE.md
 # (TEMP) Add some debug related dirs
 /docs/
 /triage/
+/experiments/
+FUZZER_MAP.md
+dedup.db*

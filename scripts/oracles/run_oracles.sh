@@ -5,6 +5,14 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
+source "$SCRIPT_DIR/../run/run_helpers.sh"
+
+# Resolve the active run dir; child oracles inherit RUN_DIR.
+if [[ -z "${RUN_DIR:-}" ]]; then
+    if RUN_DIR="$(regatoni_run_dir 2>/dev/null)"; then
+        export RUN_DIR
+    fi
+fi
 
 # --- Detect available cores (non-sequential on this host) -------------------
 detect_cores() {
@@ -38,8 +46,12 @@ DEFAULT_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
 
 # --- Default corpus discovery (mirrors verify_corpus.sh layout) -------------
 default_corpus() {
-    # run_fuzzer.sh creates build/workdir_<date>/ with corpus.* subdirs.
-    # verify_corpus.sh uses $CORPUS_DIR. Prefer the latter if populated.
+    # Prefer the active run's corpus if available; fall back to legacy paths
+    # for ad-hoc post-run inspection.
+    if [[ -n "${RUN_DIR:-}" && -d "$RUN_DIR/corpus" ]]; then
+        echo "$RUN_DIR/corpus"
+        return
+    fi
     if [[ -d "$CORPUS_DIR" ]] && compgen -G "$CORPUS_DIR/" > /dev/null; then
         echo "$CORPUS_DIR"
         return

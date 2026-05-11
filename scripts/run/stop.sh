@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
 # Stop the fuzzing pipeline started by start.sh.
 #
-# Usage: ./scripts/run/stop.sh
+# Reads runs/current to find the active run, kills its PIDs, and stamps
+# end_time into the manifest. The run directory is preserved as the artifact.
+#
+# Usage: ./scripts/run/stop.sh [RUN_ID]
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../build/env.sh" >/dev/null
-
-RUN_STATE="$BUILD_OUT/run_state"
-PIDS_FILE="$RUN_STATE/pids"
+source "$SCRIPT_DIR/run_helpers.sh"
 
 log() { echo "[$(date -Is)] [stop] $*" >&2; }
 
-if [[ ! -f "$PIDS_FILE" ]]; then
-    log "No pids file found at $PIDS_FILE — nothing to stop."
+# Resolve which run to stop. Default: whatever runs/current points at.
+if (( $# > 0 )); then
+    RUN_ID="$1"
+elif [[ -L "$PROJECT_ROOT/runs/current" ]]; then
+    RUN_ID="$(readlink "$PROJECT_ROOT/runs/current")"
+else
+    log "No active run (runs/current missing) — nothing to stop."
     exit 0
 fi
+export RUN_ID
 
-# ── Read start time from pids file mtime ────────────────────────────────────
+RUN_DIR="$(regatoni_run_dir "$RUN_ID")"
+PIDS_FILE="$RUN_DIR/pids"
+
+if [[ ! -f "$PIDS_FILE" ]]; then
+    log "No pids file at $PIDS_FILE — nothing to stop."
+    exit 0
+fi
 
 START_TIME="$(stat -c %Y "$PIDS_FILE" 2>/dev/null || date +%s)"
 
@@ -65,30 +78,44 @@ m=$(( (elapsed % 3600) / 60 ))
 s=$(( elapsed % 60 ))
 
 corpus_count=0
-if [[ -d "$CORPUS_DIR" ]]; then
-    corpus_count="$(find "$CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+if [[ -d "$RUN_DIR/corpus" ]]; then
+    corpus_count="$(find "$RUN_DIR/corpus" -maxdepth 1 -type f 2>/dev/null | wc -l)"
 fi
 
 crash_count=0
-workdir="$(ls -1dt "$BUILD_OUT"/workdir_*/crashes* 2>/dev/null | head -n1)"
-if [[ -n "$workdir" ]]; then
-    crash_count="$(find "$workdir" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+if [[ -d "$RUN_DIR/workdir" ]]; then
+    crash_count="$(find "$RUN_DIR/workdir" -maxdepth 2 -type f -path '*/crashes*/*' 2>/dev/null | wc -l)"
 fi
 
 miscomp_count=0
-if [[ -d "$PROJECT_ROOT/miscompilations" ]]; then
-    miscomp_count="$(find "$PROJECT_ROOT/miscompilations" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+if [[ -d "$RUN_DIR/miscompilations" ]]; then
+    miscomp_count="$(find "$RUN_DIR/miscompilations" -maxdepth 1 -type f 2>/dev/null | wc -l)"
 fi
 
 log "────────────────────────────────────────"
+log "RUN_ID:             $RUN_ID"
 log "Runtime:            ${h}h ${m}m ${s}s"
 log "Corpus entries:     $corpus_count"
 log "Crashes found:      $crash_count"
 log "Miscompilations:    $miscomp_count"
 log "────────────────────────────────────────"
 
-# ── Cleanup state ───────────────────────────────────────────────────────────
+# Stamp end_time and clear runs/current. Run dir itself is preserved.
+regatoni_finalize_run_dir "$RUN_ID"
+
+# Final dashboard render: this is the snapshot that gets frozen at
+# <publish-dir>/runs/<run_id>.html since the manifest now has end_time.
+DASHBOARD="$SCRIPT_DIR/../analysis/render_dashboard.py"
+if [[ -f "$DASHBOARD" ]]; then
+    PUBLISH_ARGS=()
+    if [[ -n "${DASHBOARD_PUBLISH_DIR:-}" ]]; then
+        PUBLISH_ARGS=(--publish-to "$DASHBOARD_PUBLISH_DIR")
+    fi
+    python3 "$DASHBOARD" --run-dir "$RUN_DIR" --out "$RUN_DIR/dashboard.html" \
+        "${PUBLISH_ARGS[@]}" 2>>"$RUN_DIR/dashboard.log" \
+        && log "Final dashboard render written" \
+        || log "Final dashboard render failed (see $RUN_DIR/dashboard.log)"
+fi
 
 rm -f "$PIDS_FILE"
-log "Cleaned up $RUN_STATE"
-log "Stopped."
+log "Stopped run $RUN_ID."

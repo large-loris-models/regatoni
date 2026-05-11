@@ -64,6 +64,7 @@ SRCS=(
     "$PROJECT_ROOT/src/mutators/ir_mutations/mutate_unary.cc"
     "$PROJECT_ROOT/src/mutators/ir_mutations/eliminate_undef.cc"
     "$PROJECT_ROOT/src/mutators/registry.cc"
+    "$PROJECT_ROOT/src/mutators/corpus_index.cc"
     "$PROJECT_ROOT/tests/test_mutations.cc"
 )
 
