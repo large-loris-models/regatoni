@@ -324,6 +324,7 @@ if [[ -f "$DASHBOARD" ]]; then
     fi
     (while true; do
         python3 "$DASHBOARD" --run-dir "$RUN_DIR" --out "$RUN_DIR/dashboard.html" \
+            --include-links \
             "${PUBLISH_ARGS[@]}" \
             2>>"$RUN_DIR/dashboard.log" || true
         sleep 60
