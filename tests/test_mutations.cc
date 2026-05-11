@@ -756,12 +756,19 @@ static void testMoveInstructionNoTargets() {
 
 // ============================================================================
 // Test: InlineCall
+//
+// InlineCall now splices a corpus function body into a callee *declaration*
+// and inlines it; with no CorpusIndex built (as in this unit test process), it
+// has nothing to splice and canApply is false. Full splice coverage —
+// building a real CorpusIndex and asserting a successful inline — lives in
+// src/mutators/tests/inline_call_test.cc.
 // ============================================================================
 
 static void testInlineCall() {
   LLVMContext Ctx;
 
-  auto M = parseIR(Ctx, R"(
+  // Defined callee: no longer a splice target (only declarations are).
+  auto M1 = parseIR(Ctx, R"(
     define i32 @callee(i32 %a, i32 %b) {
       %x = add i32 %a, %b
       ret i32 %x
@@ -771,39 +778,23 @@ static void testInlineCall() {
       ret i32 %r
     }
   )");
-
   InlineCall mut;
-  assert(mut.canApply(*M) && "InlineCall should apply");
+  assert(!mut.canApply(*M1) &&
+         "InlineCall should not target a defined callee");
 
-  std::string before = moduleToString(*M);
-  std::mt19937 rng(1);
-  bool changed = mut.apply(*M, rng);
-  std::string after = moduleToString(*M);
-
-  assert(changed && "InlineCall should inline");
-  assert(before != after && "Module should differ after inlining");
-  assert(isValid(*M) && "Module should still be valid after inlining");
-
-  std::cout << "  [PASS] InlineCall: inlines call, result is valid IR\n";
-}
-
-static void testInlineCallNoTargets() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
+  // Call to a declaration, but no CorpusIndex built ⇒ no signature match.
+  auto M2 = parseIR(Ctx, R"(
     declare i32 @extern_only(i32)
     define i32 @f(i32 %a) {
       %r = call i32 @extern_only(i32 %a)
       ret i32 %r
     }
   )");
+  assert(!mut.canApply(*M2) &&
+         "InlineCall should not apply without a corpus match");
 
-  InlineCall mut;
-  assert(!mut.canApply(*M) &&
-         "InlineCall should not apply without inlineable callees");
-
-  std::cout
-      << "  [PASS] InlineCall: rejects module with only external callees\n";
+  std::cout << "  [PASS] InlineCall: no-op without a built CorpusIndex "
+               "(see src/mutators/tests/inline_call_test.cc)\n";
 }
 
 // ============================================================================
@@ -1343,7 +1334,6 @@ int main() {
   testMoveInstructionChainStress();
   testMoveInstructionNoTargets();
   testInlineCall();
-  testInlineCallNoTargets();
   testRemoveVoidCall();
   testRemoveVoidCallNoTargets();
   testModifyAttributes();
