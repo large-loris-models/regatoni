@@ -281,6 +281,10 @@ Kind kindOf(const std::string &name) {
       {"llvm.cttz", K_INTRINSIC_WITH_FLAG},
       {"llvm.ctlz", K_INTRINSIC_WITH_FLAG},
       {"llvm.abs", K_INTRINSIC_WITH_FLAG},
+      // Integer casts
+      {"trunc", K_CAST},
+      {"zext", K_CAST},
+      {"sext", K_CAST},
       // Misc
       {"freeze", K_FREEZE},
       {"select", K_SELECT},
@@ -319,20 +323,29 @@ int numValueSlots(Kind k) {
     case K_FREEZE: return 1;
     case K_SELECT: return 3;
     case K_ICMP: return 2;
+    case K_CAST: return 1;
     default: return 0;
   }
 }
 
-// Type of value slot `slot` at module-instantiation type T.
-std::string slotType(Kind k, int slot, const std::string &T) {
+// Type of value slot `slot`. Most kinds use `in_type` for every value
+// slot; the exceptions are select.cond (always i1) and cast ops whose
+// single operand is the cast's source type (= in_type).
+std::string slotType(Kind k, int slot, const std::string &in_type,
+                     const std::string &out_type) {
+  (void)out_type;
   if (k == K_SELECT && slot == 0) return "i1";
-  return T;
+  return in_type;
 }
 
-// Result type of this instruction at T.
-std::string resultType(Kind k, const std::string &T) {
+// Result type of this instruction. For most kinds in_type == out_type
+// and either works. K_CAST returns out_type (the cast destination).
+// K_ICMP is always i1 regardless of the operand type.
+std::string resultType(Kind k, const std::string &in_type,
+                       const std::string &out_type) {
   if (k == K_ICMP) return "i1";
-  return T;
+  (void)in_type;
+  return out_type;
 }
 
 // Map a rule operand index (the index reported by compat-matrix.json) to
@@ -354,11 +367,13 @@ int operandToSlot(Kind k, int op_idx) {
     if (op_idx == 2) return 1;
     return -1;
   }
+  if (k == K_CAST) return op_idx == 0 ? 0 : -1;
   int n = numValueSlots(k);
   return (op_idx >= 0 && op_idx < n) ? op_idx : -1;
 }
 
-// Whether the instruction's pattern can be instantiated at T.
+// Whether the instruction's pattern can be instantiated at T (or, for
+// casts, at the destination type T).
 bool supportsType(Kind k, const std::string &inst_name,
                   const std::string &T) {
   if (!isInt(T)) return false;
@@ -366,9 +381,55 @@ bool supportsType(Kind k, const std::string &inst_name,
     int w = widthOf(T);
     return w > 0 && (w % 16 == 0);
   }
-  // The rest accept any scalar integer width.
+  // Casts: the (src, dst) pair list is the gating filter (see castPairs);
+  // any int dst is acceptable here.
   (void)k;
   return true;
+}
+
+// Preferred order of B's value slots for the control-edge composition.
+// Matrix uses target_operand = -1 for control because the dependence is
+// on the block guard rather than a specific operand; compose-gen picks
+// a slot here, trying them in order until one has a type-compatible
+// combo. div/rem put divisor (op2 / slot 1) first since "icmp ne 0" is
+// the natural guard against div-by-zero. For select we prefer the
+// value-arm slots over the i1 cond slot when A produces an integer —
+// the caller's type-combo check handles that.
+std::vector<int> controlSlotPriority(Kind tk, const std::string &tgt_name) {
+  std::vector<int> out;
+  int n = numValueSlots(tk);
+  if (n <= 0) return out;
+  auto push = [&](int s) {
+    if (s < 0 || s >= n) return;
+    for (int x : out) if (x == s) return;
+    out.push_back(s);
+  };
+  if (tgt_name == "sdiv" || tgt_name == "udiv" ||
+      tgt_name == "srem" || tgt_name == "urem")
+    push(1);
+  if (tk == K_SELECT) {
+    push(1);
+    push(2);
+    push(0);
+  }
+  for (int s = 0; s < n; ++s) push(s);
+  return out;
+}
+
+// Cast type pairs. Mirrors litmus-gen's hard-coded list so the two tools
+// emit comparable IR shapes. Returned as (src, dst).
+const std::vector<std::pair<std::string, std::string>> &
+castPairs(const std::string &inst_name) {
+  static const std::vector<std::pair<std::string, std::string>> kTrunc = {
+      {"i32", "i16"}, {"i32", "i8"}, {"i64", "i32"}, {"i16", "i8"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kExtend = {
+      {"i16", "i32"}, {"i8", "i32"}, {"i32", "i64"}, {"i8", "i16"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kEmpty;
+  if (inst_name == "trunc") return kTrunc;
+  if (inst_name == "zext" || inst_name == "sext") return kExtend;
+  return kEmpty;
 }
 
 // =========================================================================
@@ -392,6 +453,11 @@ bool ruleAppliesAtT(Kind k, const Rule &rule, const std::string &T) {
     // is too.
     if (rule.shape == "vector_elementwise" || rule.shape == "vector_broadcast")
       return false;
+  }
+  if (k == K_CAST) {
+    // .from_i1 needs i1 as the cast source; our pair list doesn't include
+    // i1, so the type filter would already drop these. Skip explicitly.
+    if (id.find(".from_i1") != std::string::npos) return false;
   }
   return true;
 }
@@ -436,9 +502,13 @@ bool intrinsicFlagValue(const Rule &rule) {
 std::string emitInstruction(Kind k, const std::string &inst_name,
                              const Rule &rule,
                              const std::string &result_var,
-                             const std::string &T,
+                             const std::string &in_type,
+                             const std::string &out_type,
                              const std::vector<std::string> &slot_vars,
                              std::set<std::string> &decls) {
+  // All kinds except K_CAST have in_type == out_type (and emit only one
+  // type). K_CAST is the only kind where the two differ.
+  const std::string &T = in_type;
   switch (k) {
     case K_BINARY_INTRINSIC: {
       const std::string call = std::string("@") + inst_name + "." + T;
@@ -479,6 +549,27 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
       return result_var + " = icmp " + flag_str + p.pred + " " + T + " " +
              slot_vars[0] + ", " + slot_vars[1];
     }
+    case K_CAST: {
+      std::string flag_str;
+      if (rule.flag.has_value()) {
+        const std::string &f = *rule.flag;
+        if (f == "nuw" || f == "nsw") {
+          if (inst_name != "trunc") return {};
+          flag_str = f + " ";
+        } else if (f == "nneg") {
+          if (inst_name != "zext") return {};
+          flag_str = "nneg ";
+        } else {
+          return {};
+        }
+      }
+      // Cast pair list never starts at i1; if the matrix sends one through
+      // anyway it's a bug, but bail out rather than emit invalid IR.
+      if (widthOf(in_type) <= 0 || widthOf(out_type) <= 0) return {};
+      if (in_type == out_type) return {};
+      return result_var + " = " + inst_name + " " + flag_str + in_type + " " +
+             slot_vars[0] + " to " + out_type;
+    }
     default:
       return {};
   }
@@ -504,34 +595,40 @@ struct ComposeResult {
   std::string fn_name;
 };
 
+// Per-side instantiation. For non-cast instructions in == out == T. For
+// casts (in, out) are the (src, dst) of the cast pair. The connection
+// constraint A.out == B's target-slot type is enforced by the caller's
+// type-combo enumeration; we still re-check here so an unexpected combo
+// fails closed.
+struct SideType {
+  std::string in;
+  std::string out;
+};
+
 std::optional<ComposeResult>
-composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_operand,
-            const std::string &edge_type, const std::string &T,
+composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
+            const std::string &edge_type, const SideType &a, const SideType &b,
             const std::string &fn_name) {
   Kind sk = kindOf(src_rule.instruction);
   Kind tk = kindOf(tgt_rule.instruction);
   if (sk == K_UNSUPPORTED || tk == K_UNSUPPORTED) return std::nullopt;
 
-  if (!supportsType(sk, src_rule.instruction, T)) return std::nullopt;
-  if (!supportsType(tk, tgt_rule.instruction, T)) return std::nullopt;
+  // For non-cast kinds, supportsType only sees one type. For casts, both
+  // src and dst must satisfy whatever per-kind width constraints apply.
+  if (!supportsType(sk, src_rule.instruction, a.in)) return std::nullopt;
+  if (!supportsType(sk, src_rule.instruction, a.out)) return std::nullopt;
+  if (!supportsType(tk, tgt_rule.instruction, b.in)) return std::nullopt;
+  if (!supportsType(tk, tgt_rule.instruction, b.out)) return std::nullopt;
 
-  if (!ruleAppliesAtT(sk, src_rule, T)) return std::nullopt;
-  if (!ruleAppliesAtT(tk, tgt_rule, T)) return std::nullopt;
+  if (!ruleAppliesAtT(sk, src_rule, a.in)) return std::nullopt;
+  if (!ruleAppliesAtT(tk, tgt_rule, b.in)) return std::nullopt;
 
-  int target_slot = operandToSlot(tk, target_operand);
-  if (target_slot < 0) return std::nullopt;
+  if (target_slot < 0 || target_slot >= numValueSlots(tk)) return std::nullopt;
 
   // Type match at the connection point.
-  const std::string src_result = resultType(sk, T);
-  const std::string tgt_slot_t = slotType(tk, target_slot, T);
+  const std::string src_result = resultType(sk, a.in, a.out);
+  const std::string tgt_slot_t = slotType(tk, target_slot, b.in, b.out);
   if (src_result != tgt_slot_t) return std::nullopt;
-
-  // Source can't be ICMP for now (it produces i1; nothing in V1 reads i1
-  // at a value slot besides select.cond at slot 0, which the matrix
-  // *does* expose — but it would need i1 source rules that we'd want to
-  // emit too. Defer; the type-match check above already filters this
-  // unless the user requests --types i1).
-  // (No special-case needed: the type match handles it.)
 
   const int n_src_slots = numValueSlots(sk);
   const int n_tgt_slots = numValueSlots(tk);
@@ -546,7 +643,7 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_operand,
   int next_p = 0;
   for (int i = 0; i < n_src_slots; ++i) {
     src_slots[i] = varName(next_p++);
-    param_types.push_back(slotType(sk, i, T));
+    param_types.push_back(slotType(sk, i, a.in, a.out));
     param_vars.push_back(src_slots[i]);
   }
   // The variable holding A's result that target B will consume.
@@ -556,24 +653,23 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_operand,
       tgt_slots[i] = a_value;
     } else {
       tgt_slots[i] = varName(next_p++);
-      param_types.push_back(slotType(tk, i, T));
+      param_types.push_back(slotType(tk, i, b.in, b.out));
       param_vars.push_back(tgt_slots[i]);
     }
   }
 
-  // Memory edge stores/loads T, so the loaded type must equal T (which
-  // is also what A produced if we got this far).
-  if (edge_type == "memory" && src_result != T) return std::nullopt;
-
   std::set<std::string> decls;
   std::string a_insn = emitInstruction(sk, src_rule.instruction, src_rule,
-                                        "%a", T, src_slots, decls);
+                                        "%a", a.in, a.out, src_slots, decls);
   if (a_insn.empty()) return std::nullopt;
   std::string b_insn = emitInstruction(tk, tgt_rule.instruction, tgt_rule,
-                                        "%b", T, tgt_slots, decls);
+                                        "%b", b.in, b.out, tgt_slots, decls);
   if (b_insn.empty()) return std::nullopt;
 
-  const std::string ret_type = resultType(tk, T);
+  const std::string ret_type = resultType(tk, b.in, b.out);
+  // Memory edge stores/loads A's result type (which equals B's input at
+  // the connection point per the type-match check above).
+  const std::string &mem_t = src_result;
 
   std::ostringstream os;
   for (const auto &d : decls) os << d << "\n";
@@ -585,16 +681,37 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_operand,
   }
   os << ") {\n";
   if (edge_type == "memory") {
-    os << "  %p = alloca " << T << "\n";
+    os << "  %p = alloca " << mem_t << "\n";
     os << "  " << a_insn << "\n";
-    os << "  store " << T << " %a, ptr %p\n";
-    os << "  %ld = load " << T << ", ptr %p\n";
+    os << "  store " << mem_t << " %a, ptr %p\n";
+    os << "  %ld = load " << mem_t << ", ptr %p\n";
     os << "  " << b_insn << "\n";
+    os << "  ret " << ret_type << " %b\n";
+  } else if (edge_type == "control") {
+    // Multi-BB: A's value gates B's execution via "icmp ne A, 0; br".
+    // In the then branch %a is non-zero (and not poison, since poison
+    // through icmp+br would be UB at the branch). B can still use %a in
+    // its target slot because entry dominates then.
+    const std::string &a_t = src_result;
+    os << "entry:\n";
+    os << "  " << a_insn << "\n";
+    if (a_t == "i1") {
+      // %a is already i1; skip the redundant "icmp ne i1 %a, 0" form.
+      os << "  br i1 %a, label %then, label %else\n";
+    } else {
+      os << "  %cond = icmp ne " << a_t << " %a, 0\n";
+      os << "  br i1 %cond, label %then, label %else\n";
+    }
+    os << "then:\n";
+    os << "  " << b_insn << "\n";
+    os << "  ret " << ret_type << " %b\n";
+    os << "else:\n";
+    os << "  ret " << ret_type << " 0\n";
   } else {
     os << "  " << a_insn << "\n";
     os << "  " << b_insn << "\n";
+    os << "  ret " << ret_type << " %b\n";
   }
-  os << "  ret " << ret_type << " %b\n";
   os << "}\n";
 
   return ComposeResult{os.str(), fn_name};
@@ -617,8 +734,26 @@ std::string sanitize(std::string s) {
 // full id for now to avoid ambiguity between sibling rules.
 std::string ruleSlug(const std::string &id) { return sanitize(id); }
 
+// Pipeline type slug: collapses adjacent duplicates in the sequence
+// (a.in, a.out, b.out). a.out == b.in by the connection constraint, so it
+// appears only once. Examples: ("i32","i32","i32","i32") -> "i32";
+// ("i32","i16","i16","i16") -> "i32_i16" (cast A, non-cast B);
+// ("i32","i16","i16","i32") -> "i32_i16_i32" (round-trip).
+std::string typeSlug(const SideType &a, const SideType &b) {
+  std::vector<std::string> seq = {a.in, a.out, b.out};
+  std::string out;
+  for (size_t i = 0; i < seq.size(); ++i) {
+    if (i == 0 || seq[i] != seq[i - 1]) {
+      if (!out.empty()) out += "_";
+      out += seq[i];
+    }
+  }
+  return out;
+}
+
 std::string baseName(const Rule &src, const Rule &tgt, int target_operand,
-                     const std::string &edge_type, const std::string &T) {
+                     const std::string &edge_type, const SideType &a,
+                     const SideType &b) {
   std::string out = "compose__";
   out += ruleSlug(src.id);
   out += "__";
@@ -627,7 +762,7 @@ std::string baseName(const Rule &src, const Rule &tgt, int target_operand,
     out += "_op" + std::to_string(target_operand);
   }
   out += "__" + edge_type;
-  out += "__" + T;
+  out += "__" + typeSlug(a, b);
   return out;
 }
 
@@ -744,19 +879,88 @@ struct Options {
   std::string matrix_path;
   std::vector<std::string> rules_paths;
   std::string output_dir;
-  std::vector<std::string> edge_types{"ssa", "memory"};
-  std::vector<std::string> types{"i32"};
+  std::vector<std::string> edge_types{"ssa", "memory", "control"};
+  std::vector<std::string> types{"i8", "i16", "i32", "i64"};
   std::string opt_path = "deps/llvm-build-plain/bin/opt";
   bool no_verify = false;
   size_t max_failure_log = 20;
 };
 
+// Enumerate all (A.in, A.out, B.in, B.out) combinations that satisfy the
+// per-side cast pair constraint and the connection constraint
+// (a.out == B's type at target slot). For non-cast sides, types come from
+// the user's --types filter. For cast sides, types come from the
+// hard-coded pair list, regardless of --types (matches litmus-gen).
+std::vector<std::pair<SideType, SideType>>
+typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
+                  const std::string &tgt_name, int target_slot,
+                  const std::set<std::string> &requested_types) {
+  std::vector<std::pair<SideType, SideType>> out;
+  const bool a_cast = (sk == K_CAST);
+  const bool b_cast = (tk == K_CAST);
+
+  auto tgtSlotType = [&](const std::string &b_in, const std::string &b_out) {
+    return slotType(tk, target_slot, b_in, b_out);
+  };
+  auto srcResultType = [&](const std::string &a_in, const std::string &a_out) {
+    return resultType(sk, a_in, a_out);
+  };
+
+  if (!a_cast && !b_cast) {
+    for (const auto &T : requested_types) {
+      SideType A{T, T}, B{T, T};
+      if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
+      out.push_back({A, B});
+    }
+    return out;
+  }
+  if (a_cast && !b_cast) {
+    for (const auto &p : castPairs(src_name)) {
+      SideType A{p.first, p.second};
+      // B is non-cast → B.in == B.out == some T. Need T == slotType(B).
+      // For most kinds slotType returns B.in directly, so T = A.out.
+      // For K_SELECT slot 0 == i1, but A.out from our cast pair list is
+      // never i1, so that combo is skipped by the connection check.
+      const std::string T = A.out;
+      SideType B{T, T};
+      if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
+      out.push_back({A, B});
+    }
+    return out;
+  }
+  if (!a_cast && b_cast) {
+    for (const auto &p : castPairs(tgt_name)) {
+      SideType B{p.first, p.second};
+      // A is non-cast → A.in == A.out == T. A.out must equal B's input.
+      const std::string T = B.in;
+      SideType A{T, T};
+      // For K_ICMP source, srcResultType is i1 (not T). The cast pair
+      // list doesn't include i1 source, so the connection always fails.
+      if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
+      out.push_back({A, B});
+    }
+    return out;
+  }
+  // Both casts: enumerate (A pair, B pair) where A.out == B.in.
+  for (const auto &pa : castPairs(src_name)) {
+    SideType A{pa.first, pa.second};
+    for (const auto &pb : castPairs(tgt_name)) {
+      SideType B{pb.first, pb.second};
+      if (A.out != B.in) continue;
+      if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
+      out.push_back({A, B});
+    }
+  }
+  (void)requested_types;
+  return out;
+}
+
 [[noreturn]] void usage(int code) {
   std::fprintf(stderr,
                "Usage: compose-gen --matrix <path.json> --rules <rules.json> [--rules ...]\n"
                "                   --output-dir <dir>\n"
-               "                   [--edge-types ssa,memory]\n"
-               "                   [--types i32]\n"
+               "                   [--edge-types ssa,memory,control]\n"
+               "                   [--types i8,i16,i32,i64]\n"
                "                   [--opt <path-to-opt>]\n"
                "                   [--no-verify]\n");
   std::exit(code);
@@ -874,7 +1078,10 @@ int main(int argc, char **argv) {
     std::string tgt_id = edge["target_rule"].get<std::string>();
     int target_op = edge["target_operand"].get<int>();
     const json &eta = edge["edge_types"];
-    if (!eta.is_array() || target_op < 0) continue;
+    if (!eta.is_array()) continue;
+    // Matrix uses target_op = -1 for control (no specific operand
+    // position). For SSA / memory edges target_op must be a real slot.
+    // We tolerate -1 here and reject per-edge-type below.
 
     auto sit = db.rule_index.find(src_id);
     auto tit = db.rule_index.find(tgt_id);
@@ -897,11 +1104,51 @@ int main(int argc, char **argv) {
       std::string et = etv.get<std::string>();
       if (!requested_edges.count(et)) continue;
 
-      for (const auto &T : opts.types) {
-        if (!requested_types.count(T)) continue;
+      // Pick the target value slot for B. SSA/memory: derived from the
+      // matrix's target_operand (matrix records the storable-op index
+      // for memory). Control: matrix uses -1, so we scan slot candidates
+      // in priority order until one yields a type-compatible combo.
+      std::vector<int> slot_candidates;
+      if (et == "control") {
+        if (target_op != -1) {
+          ++edges_skipped_filter;
+          continue;
+        }
+        slot_candidates = controlSlotPriority(tk, tr.instruction);
+      } else {
+        if (target_op < 0) {
+          ++edges_skipped_filter;
+          continue;
+        }
+        int s = operandToSlot(tk, target_op);
+        if (s >= 0) slot_candidates.push_back(s);
+      }
+      if (slot_candidates.empty()) {
+        ++edges_skipped_filter;
+        continue;
+      }
+
+      int slot_for_types = -1;
+      std::vector<std::pair<SideType, SideType>> combos;
+      for (int s : slot_candidates) {
+        combos = typeCombosForEdge(sk, sr.instruction, tk, tr.instruction, s,
+                                    requested_types);
+        if (!combos.empty()) {
+          slot_for_types = s;
+          break;
+        }
+      }
+      if (combos.empty()) {
+        ++edges_skipped_filter;
+        continue;
+      }
+
+      for (const auto &combo : combos) {
+        const SideType &A = combo.first;
+        const SideType &B = combo.second;
         ++total_edges_seen;
 
-        std::string base = baseName(sr, tr, target_op, et, T);
+        std::string base = baseName(sr, tr, target_op, et, A, B);
         std::string fname = base;
         int dedup = 1;
         while (seen_files.count(fname)) {
@@ -909,8 +1156,7 @@ int main(int argc, char **argv) {
         }
 
         std::string fn_name = sanitize(fname);
-        auto cr =
-            composeEdge(sr, tr, target_op, et, T, fn_name);
+        auto cr = composeEdge(sr, tr, slot_for_types, et, A, B, fn_name);
         if (!cr) {
           ++edges_skipped_filter;
           continue;
