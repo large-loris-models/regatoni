@@ -10,6 +10,9 @@ deps/
 regatoni.local.conf
 .claude
 
+# Ignore misc arhive
+archive/
+
 # Corpus runtime data (seeds checked in separately)
 corpus/
 seeds/
