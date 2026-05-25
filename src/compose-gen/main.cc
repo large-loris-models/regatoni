@@ -230,6 +230,12 @@ enum Kind {
   K_GEP,
   K_LOAD_STORE,
   K_EXTRACTVALUE,
+  K_FP_BINARY,
+  K_FP_UNARY,
+  K_FP_UNARY_INTRINSIC,
+  K_FP_BINARY_INTRINSIC,
+  K_FP_TERNARY_INTRINSIC,
+  K_FCMP,
   K_UNSUPPORTED,
 };
 
@@ -247,6 +253,12 @@ const char *kindName(Kind k) {
     case K_GEP: return "gep";
     case K_LOAD_STORE: return "load_store";
     case K_EXTRACTVALUE: return "extractvalue";
+    case K_FP_BINARY: return "fp_binary";
+    case K_FP_UNARY: return "fp_unary";
+    case K_FP_UNARY_INTRINSIC: return "fp_unary_intrinsic";
+    case K_FP_BINARY_INTRINSIC: return "fp_binary_intrinsic";
+    case K_FP_TERNARY_INTRINSIC: return "fp_ternary_intrinsic";
+    case K_FCMP: return "fcmp";
     case K_UNSUPPORTED: return "unsupported";
   }
   return "?";
@@ -289,14 +301,56 @@ Kind kindOf(const std::string &name) {
       {"freeze", K_FREEZE},
       {"select", K_SELECT},
       {"icmp", K_ICMP},
+      // FP binary ops
+      {"fadd", K_FP_BINARY},
+      {"fsub", K_FP_BINARY},
+      {"fmul", K_FP_BINARY},
+      {"fdiv", K_FP_BINARY},
+      {"frem", K_FP_BINARY},
+      // FP unary op
+      {"fneg", K_FP_UNARY},
+      // FP unary intrinsics (note: llvm.trunc is the FP rounding intrinsic,
+      // distinct from the integer 'trunc' cast above)
+      {"llvm.sqrt", K_FP_UNARY_INTRINSIC},
+      {"llvm.sin", K_FP_UNARY_INTRINSIC},
+      {"llvm.cos", K_FP_UNARY_INTRINSIC},
+      {"llvm.exp", K_FP_UNARY_INTRINSIC},
+      {"llvm.exp2", K_FP_UNARY_INTRINSIC},
+      {"llvm.log", K_FP_UNARY_INTRINSIC},
+      {"llvm.log10", K_FP_UNARY_INTRINSIC},
+      {"llvm.log2", K_FP_UNARY_INTRINSIC},
+      {"llvm.fabs", K_FP_UNARY_INTRINSIC},
+      {"llvm.floor", K_FP_UNARY_INTRINSIC},
+      {"llvm.ceil", K_FP_UNARY_INTRINSIC},
+      {"llvm.round", K_FP_UNARY_INTRINSIC},
+      {"llvm.rint", K_FP_UNARY_INTRINSIC},
+      {"llvm.nearbyint", K_FP_UNARY_INTRINSIC},
+      {"llvm.roundeven", K_FP_UNARY_INTRINSIC},
+      {"llvm.canonicalize", K_FP_UNARY_INTRINSIC},
+      {"llvm.trunc", K_FP_UNARY_INTRINSIC},
+      // FP binary intrinsics
+      {"llvm.pow", K_FP_BINARY_INTRINSIC},
+      {"llvm.copysign", K_FP_BINARY_INTRINSIC},
+      {"llvm.minnum", K_FP_BINARY_INTRINSIC},
+      {"llvm.maxnum", K_FP_BINARY_INTRINSIC},
+      {"llvm.minimum", K_FP_BINARY_INTRINSIC},
+      {"llvm.maximum", K_FP_BINARY_INTRINSIC},
+      {"llvm.minimumnum", K_FP_BINARY_INTRINSIC},
+      {"llvm.maximumnum", K_FP_BINARY_INTRINSIC},
+      // FP ternary intrinsics
+      {"llvm.fma", K_FP_TERNARY_INTRINSIC},
+      {"llvm.fmuladd", K_FP_TERNARY_INTRINSIC},
+      // FP comparison
+      {"fcmp", K_FCMP},
   };
   auto it = table.find(name);
   return it == table.end() ? K_UNSUPPORTED : it->second;
 }
 
 // =========================================================================
-// Type helpers. V1 instantiates against scalar integer types ("i8", "i16",
-// "i32", "i64"). Everything else is rejected at the per-rule type filter.
+// Type helpers. Instantiates against scalar integer types ("i8", "i16",
+// "i32", "i64") and scalar FP types ("float", "double"). Everything else
+// is rejected at the per-rule type filter.
 // =========================================================================
 
 bool isInt(const std::string &t) {
@@ -309,6 +363,48 @@ bool isInt(const std::string &t) {
 int widthOf(const std::string &t) {
   if (!isInt(t)) return -1;
   return std::atoi(t.c_str() + 1);
+}
+
+bool isFP(const std::string &t) { return t == "float" || t == "double"; }
+
+// Intrinsic name suffix: integer types map to "iN", FP to "f32"/"f64".
+std::string intrinsicSuffix(const std::string &t) {
+  if (isInt(t)) return t;
+  if (t == "float") return "f32";
+  if (t == "double") return "f64";
+  return {};
+}
+
+bool isFPKind(Kind k) {
+  switch (k) {
+    case K_FP_BINARY:
+    case K_FP_UNARY:
+    case K_FP_UNARY_INTRINSIC:
+    case K_FP_BINARY_INTRINSIC:
+    case K_FP_TERNARY_INTRINSIC:
+    case K_FCMP:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isFastMathFlag(const std::string &f) {
+  return f == "fast" || f == "nnan" || f == "ninf" || f == "nsz" ||
+         f == "arcp" || f == "contract" || f == "afn" || f == "reassoc";
+}
+
+// FMF prefix for an FP instruction, derived from rule.flag. Trailing space
+// included for direct concatenation; empty string when no FMF applies.
+std::string fmfPrefix(const Rule &rule) {
+  if (rule.flag.has_value() && isFastMathFlag(*rule.flag))
+    return *rule.flag + " ";
+  return {};
+}
+
+std::string typedZero(const std::string &ty) {
+  if (isFP(ty)) return "0.0";
+  return "0";
 }
 
 // Number of value-bearing operand slots for this kind. Constant/immarg
@@ -324,6 +420,12 @@ int numValueSlots(Kind k) {
     case K_SELECT: return 3;
     case K_ICMP: return 2;
     case K_CAST: return 1;
+    case K_FP_BINARY: return 2;
+    case K_FP_UNARY: return 1;
+    case K_FP_UNARY_INTRINSIC: return 1;
+    case K_FP_BINARY_INTRINSIC: return 2;
+    case K_FP_TERNARY_INTRINSIC: return 3;
+    case K_FCMP: return 2;
     default: return 0;
   }
 }
@@ -340,10 +442,10 @@ std::string slotType(Kind k, int slot, const std::string &in_type,
 
 // Result type of this instruction. For most kinds in_type == out_type
 // and either works. K_CAST returns out_type (the cast destination).
-// K_ICMP is always i1 regardless of the operand type.
+// K_ICMP / K_FCMP are always i1 regardless of the operand type.
 std::string resultType(Kind k, const std::string &in_type,
                        const std::string &out_type) {
-  if (k == K_ICMP) return "i1";
+  if (k == K_ICMP || k == K_FCMP) return "i1";
   (void)in_type;
   return out_type;
 }
@@ -362,7 +464,7 @@ std::string resultType(Kind k, const std::string &in_type,
 //     here with op_idx in {1, 2}.
 int operandToSlot(Kind k, int op_idx) {
   if (k == K_INTRINSIC_WITH_FLAG) return op_idx == 0 ? 0 : -1;
-  if (k == K_ICMP) {
+  if (k == K_ICMP || k == K_FCMP) {
     if (op_idx == 1) return 0;
     if (op_idx == 2) return 1;
     return -1;
@@ -373,9 +475,11 @@ int operandToSlot(Kind k, int op_idx) {
 }
 
 // Whether the instruction's pattern can be instantiated at T (or, for
-// casts, at the destination type T).
+// casts, at the destination type T). FP kinds accept only float/double;
+// integer kinds accept only integer types.
 bool supportsType(Kind k, const std::string &inst_name,
                   const std::string &T) {
+  if (isFPKind(k)) return isFP(T);
   if (!isInt(T)) return false;
   if (inst_name == "llvm.bswap") {
     int w = widthOf(T);
@@ -383,7 +487,6 @@ bool supportsType(Kind k, const std::string &inst_name,
   }
   // Casts: the (src, dst) pair list is the gating filter (see castPairs);
   // any int dst is acceptable here.
-  (void)k;
   return true;
 }
 
@@ -480,6 +583,18 @@ IcmpPred icmpPredFromRule(const Rule &rule) {
   return p;
 }
 
+// Predicate for fcmp rules. The brief specifies "one" as the default
+// ordered predicate; "une" mirrors it on the unordered side. The literal
+// "false"/"true" predicates are first-class in LLVM IR.
+std::string fcmpPredFromRule(const Rule &rule) {
+  const std::string &id = rule.id;
+  if (id == "fcmp.defined.false") return "false";
+  if (id == "fcmp.defined.true") return "true";
+  if (id == "fcmp.defined.ordered") return "one";
+  if (id == "fcmp.defined.unordered") return "une";
+  return {};
+}
+
 // For K_INTRINSIC_WITH_FLAG (cttz/ctlz/abs), pick the i1 immarg value
 // from the rule. param_flag_poison shapes say "the flag is on", named
 // rules carry the explicit case in their id.
@@ -569,6 +684,48 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
       if (in_type == out_type) return {};
       return result_var + " = " + inst_name + " " + flag_str + in_type + " " +
              slot_vars[0] + " to " + out_type;
+    }
+    case K_FP_BINARY: {
+      // fadd / fsub / fmul / fdiv / frem.
+      return result_var + " = " + inst_name + " " + fmfPrefix(rule) + T + " " +
+             slot_vars[0] + ", " + slot_vars[1];
+    }
+    case K_FP_UNARY: {
+      // fneg.
+      return result_var + " = " + inst_name + " " + fmfPrefix(rule) + T + " " +
+             slot_vars[0];
+    }
+    case K_FP_UNARY_INTRINSIC: {
+      const std::string suffix = intrinsicSuffix(T);
+      if (suffix.empty()) return {};
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare " + T + " " + call + "(" + T + ")");
+      return result_var + " = call " + fmfPrefix(rule) + T + " " + call + "(" +
+             T + " " + slot_vars[0] + ")";
+    }
+    case K_FP_BINARY_INTRINSIC: {
+      const std::string suffix = intrinsicSuffix(T);
+      if (suffix.empty()) return {};
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare " + T + " " + call + "(" + T + ", " + T + ")");
+      return result_var + " = call " + fmfPrefix(rule) + T + " " + call + "(" +
+             T + " " + slot_vars[0] + ", " + T + " " + slot_vars[1] + ")";
+    }
+    case K_FP_TERNARY_INTRINSIC: {
+      const std::string suffix = intrinsicSuffix(T);
+      if (suffix.empty()) return {};
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare " + T + " " + call + "(" + T + ", " + T + ", " +
+                   T + ")");
+      return result_var + " = call " + fmfPrefix(rule) + T + " " + call + "(" +
+             T + " " + slot_vars[0] + ", " + T + " " + slot_vars[1] + ", " +
+             T + " " + slot_vars[2] + ")";
+    }
+    case K_FCMP: {
+      const std::string pred = fcmpPredFromRule(rule);
+      if (pred.empty()) return {};
+      return result_var + " = fcmp " + fmfPrefix(rule) + pred + " " + T + " " +
+             slot_vars[0] + ", " + slot_vars[1];
     }
     default:
       return {};
@@ -688,16 +845,20 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
     os << "  " << b_insn << "\n";
     os << "  ret " << ret_type << " %b\n";
   } else if (edge_type == "control") {
-    // Multi-BB: A's value gates B's execution via "icmp ne A, 0; br".
+    // Multi-BB: A's value gates B's execution via a comparison + br.
     // In the then branch %a is non-zero (and not poison, since poison
     // through icmp+br would be UB at the branch). B can still use %a in
-    // its target slot because entry dominates then.
+    // its target slot because entry dominates then. FP sources use
+    // "fcmp une <T> %a, 0.0" instead of icmp.
     const std::string &a_t = src_result;
     os << "entry:\n";
     os << "  " << a_insn << "\n";
     if (a_t == "i1") {
-      // %a is already i1; skip the redundant "icmp ne i1 %a, 0" form.
+      // %a is already i1; skip the redundant comparison.
       os << "  br i1 %a, label %then, label %else\n";
+    } else if (isFP(a_t)) {
+      os << "  %cond = fcmp une " << a_t << " %a, 0.0\n";
+      os << "  br i1 %cond, label %then, label %else\n";
     } else {
       os << "  %cond = icmp ne " << a_t << " %a, 0\n";
       os << "  br i1 %cond, label %then, label %else\n";
@@ -706,7 +867,7 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
     os << "  " << b_insn << "\n";
     os << "  ret " << ret_type << " %b\n";
     os << "else:\n";
-    os << "  ret " << ret_type << " 0\n";
+    os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
   } else {
     os << "  " << a_insn << "\n";
     os << "  " << b_insn << "\n";
@@ -880,7 +1041,7 @@ struct Options {
   std::vector<std::string> rules_paths;
   std::string output_dir;
   std::vector<std::string> edge_types{"ssa", "memory", "control"};
-  std::vector<std::string> types{"i8", "i16", "i32", "i64"};
+  std::vector<std::string> types{"i8", "i16", "i32", "i64", "float", "double"};
   std::string opt_path = "deps/llvm-build-plain/bin/opt";
   bool no_verify = false;
   size_t max_failure_log = 20;
@@ -908,6 +1069,11 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
 
   if (!a_cast && !b_cast) {
     for (const auto &T : requested_types) {
+      // Per-side type gating: FP kinds accept only float/double, int kinds
+      // only iN. Without this filter, every (fadd, add)-style edge would
+      // emit a combo at every type and be rejected later in composeEdge.
+      if (!supportsType(sk, src_name, T)) continue;
+      if (!supportsType(tk, tgt_name, T)) continue;
       SideType A{T, T}, B{T, T};
       if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
       out.push_back({A, B});
@@ -960,7 +1126,7 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
                "Usage: compose-gen --matrix <path.json> --rules <rules.json> [--rules ...]\n"
                "                   --output-dir <dir>\n"
                "                   [--edge-types ssa,memory,control]\n"
-               "                   [--types i8,i16,i32,i64]\n"
+               "                   [--types i8,i16,i32,i64,float,double]\n"
                "                   [--opt <path-to-opt>]\n"
                "                   [--no-verify]\n");
   std::exit(code);
