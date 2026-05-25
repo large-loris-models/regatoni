@@ -2,7 +2,8 @@
 # Helpers for per-run directory layout under runs/<RUN_ID>/.
 #
 # Each fuzzing run gets its own directory containing all of its state.
-# Cross-run state (dedup.db, the seed corpus pool) lives at the project root.
+# Cross-run state — by default dedup.db at the project root (override with
+# REGATONI_DEDUP_DB) and the seed corpus pool — lives at the project root.
 #
 # Sourced by scripts/run/start.sh and scripts/run/stop.sh.
 

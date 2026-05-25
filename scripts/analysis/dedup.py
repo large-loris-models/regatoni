@@ -23,6 +23,7 @@ Subcommands:
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from pathlib import Path
 
 # Repo root: scripts/analysis/dedup.py -> parents[2].
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = REPO_ROOT / "dedup.db"
+DB_PATH = Path(os.environ.get("REGATONI_DEDUP_DB", str(REPO_ROOT / "dedup.db")))
 BISECT_SCRIPT = REPO_ROOT / "scripts" / "analysis" / "bisect_blame.sh"
 # Default scan dir for cmd_migrate; per-run miscompilations live under
 # runs/<RUN_ID>/miscompilations and the triage flow passes --misc-dir.

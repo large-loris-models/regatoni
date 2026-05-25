@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = REPO_ROOT / "dedup.db"
+DB_PATH = Path(os.environ.get("REGATONI_DEDUP_DB", str(REPO_ROOT / "dedup.db")))
 
 
 def truncate(text: str, max_lines: int, max_chars: int) -> str:

@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_DB = REPO_ROOT / "dedup.db"
+DEFAULT_DB = Path(os.environ.get("REGATONI_DEDUP_DB", str(REPO_ROOT / "dedup.db")))
 DEFAULT_RUN_DIR = REPO_ROOT / "runs" / "current"
 RUNS_DIR = REPO_ROOT / "runs"
 

@@ -72,7 +72,7 @@ DEDUP_LOG="$RUN_DIR/dedup.log"
 ORACLE_RESULTS_DIR="$RUN_DIR/oracle_results"
 ORCHESTRATOR="$SCRIPT_DIR/triage_buckets.py"
 MAX_PER_BUCKET="${TRIAGE_MAX_PER_BUCKET:-15}"
-DEDUP_DB="$PROJECT_ROOT/dedup.db"
+DEDUP_DB="${REGATONI_DEDUP_DB:-$PROJECT_ROOT/dedup.db}"
 
 mkdir -p "$TRIAGE_DIR"
 
@@ -134,15 +134,15 @@ fi
 # Compute the list of buckets that need work, for logging / dry-run.
 if (( FORCE == 1 )); then
     mapfile -t BUCKETS < <(python3 -c "
-import sqlite3, os
-c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'dedup.db'))
+import sqlite3
+c = sqlite3.connect('$DEDUP_DB')
 for r in c.execute('SELECT bucket_id FROM buckets ORDER BY bucket_id'):
     print(r[0])
 ")
 else
     mapfile -t BUCKETS < <(python3 -c "
-import sqlite3, os
-c = sqlite3.connect(os.path.join('$PROJECT_ROOT', 'dedup.db'))
+import sqlite3
+c = sqlite3.connect('$DEDUP_DB')
 sql = '''SELECT DISTINCT f.bucket_id FROM findings f
          LEFT JOIN finding_sub_cluster fsc ON fsc.finding_id = f.finding_id
          WHERE fsc.sub_cluster_id IS NULL
@@ -192,10 +192,9 @@ python3 "$SCRIPT_DIR/render_triage_report.py" --output "$REPORT"
 echo "[triage] wrote $REPORT" >&2
 
 # last_run.json: timestamp + counts.
-python3 - "$RUN_TS" "$LAST_RUN" "$ORCH_RC" <<'PYEOF'
-import json, sqlite3, sys, os
-run_ts, last_run_path, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
-db = os.path.join(os.environ["PROJECT_ROOT"], "dedup.db")
+python3 - "$RUN_TS" "$LAST_RUN" "$ORCH_RC" "$DEDUP_DB" <<'PYEOF'
+import json, sqlite3, sys
+run_ts, last_run_path, rc, db = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 c = sqlite3.connect(db)
 n_findings = c.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
 n_buckets = c.execute("SELECT COUNT(*) FROM buckets").fetchone()[0]

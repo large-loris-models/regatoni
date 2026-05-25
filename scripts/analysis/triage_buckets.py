@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEDUP_PY = SCRIPT_DIR / "dedup.py"
 PROMPT_SRC = SCRIPT_DIR / "BUCKET_TRIAGE_PROMPT.md"
+DB_PATH = Path(os.environ.get("REGATONI_DEDUP_DB", str(REPO_ROOT / "dedup.db")))
 
 
 def run_dedup(*args: str, capture: bool = False) -> str:
@@ -411,7 +412,7 @@ def main() -> int:
     if args.force:
         # Every bucket with at least one finding is a candidate.
         import sqlite3
-        conn = sqlite3.connect(str(REPO_ROOT / "dedup.db"))
+        conn = sqlite3.connect(str(DB_PATH))
         try:
             buckets = [r[0] for r in conn.execute(
                 "SELECT bucket_id FROM buckets ORDER BY bucket_id"
@@ -421,7 +422,7 @@ def main() -> int:
     else:
         # Buckets with at least one untriaged finding.
         import sqlite3
-        conn = sqlite3.connect(str(REPO_ROOT / "dedup.db"))
+        conn = sqlite3.connect(str(DB_PATH))
         try:
             buckets = [r[0] for r in conn.execute(
                 "SELECT DISTINCT f.bucket_id FROM findings f "
