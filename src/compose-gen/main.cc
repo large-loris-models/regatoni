@@ -231,8 +231,15 @@ enum Kind {
   K_SELECT,
   K_ICMP,
   K_GEP,
-  K_LOAD_STORE,
+  K_LOAD,
+  K_STORE,
+  K_MEMINTRINSIC,
   K_EXTRACTVALUE,
+  K_EXTRACTELEMENT,
+  K_INSERTELEMENT,
+  K_VECTOR_REDUCE,
+  K_VECTOR_REDUCE_FOLD,
+  K_BITCAST,
   K_FP_BINARY,
   K_FP_UNARY,
   K_FP_UNARY_INTRINSIC,
@@ -262,8 +269,15 @@ const char *kindName(Kind k) {
     case K_SELECT: return "select";
     case K_ICMP: return "icmp";
     case K_GEP: return "gep";
-    case K_LOAD_STORE: return "load_store";
+    case K_LOAD: return "load";
+    case K_STORE: return "store";
+    case K_MEMINTRINSIC: return "memintrinsic";
     case K_EXTRACTVALUE: return "extractvalue";
+    case K_EXTRACTELEMENT: return "extractelement";
+    case K_INSERTELEMENT: return "insertelement";
+    case K_VECTOR_REDUCE: return "vector_reduce";
+    case K_VECTOR_REDUCE_FOLD: return "vector_reduce_fold";
+    case K_BITCAST: return "bitcast";
     case K_FP_BINARY: return "fp_binary";
     case K_FP_UNARY: return "fp_unary";
     case K_FP_UNARY_INTRINSIC: return "fp_unary_intrinsic";
@@ -349,6 +363,44 @@ Kind kindOf(const std::string &name) {
       // Saturating FP-to-int conversions: (FP) -> int, clamped.
       {"llvm.fptoui.sat", K_FPTOI_SAT},
       {"llvm.fptosi.sat", K_FPTOI_SAT},
+      // libm-style FP-to-int rounding: (FP) -> i32 or i64. Same emission
+      // pattern as K_FPTOI_SAT (two-suffix mangling: result type then
+      // source type) so we reuse the kind.
+      {"llvm.lround", K_FPTOI_SAT},
+      {"llvm.llround", K_FPTOI_SAT},
+      {"llvm.lrint", K_FPTOI_SAT},
+      {"llvm.llrint", K_FPTOI_SAT},
+      // Vector reductions (integer): (<4 x iT>) -> iT.
+      {"llvm.vector.reduce.add", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.mul", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.and", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.or", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.xor", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.smax", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.smin", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.umax", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.umin", K_VECTOR_REDUCE},
+      // Vector reductions (FP, single vector input): (<4 x fpT>) -> fpT.
+      {"llvm.vector.reduce.fmax", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.fmin", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.fmaximum", K_VECTOR_REDUCE},
+      {"llvm.vector.reduce.fminimum", K_VECTOR_REDUCE},
+      // Vector reductions (FP, fold with start value): (fpT, <4 x fpT>) -> fpT.
+      {"llvm.vector.reduce.fadd", K_VECTOR_REDUCE_FOLD},
+      {"llvm.vector.reduce.fmul", K_VECTOR_REDUCE_FOLD},
+      // Vector element accessors.
+      {"extractelement", K_EXTRACTELEMENT},
+      {"insertelement", K_INSERTELEMENT},
+      // Memory ops.
+      {"getelementptr", K_GEP},
+      {"load", K_LOAD},
+      {"store", K_STORE},
+      {"llvm.memcpy", K_MEMINTRINSIC},
+      {"llvm.memmove", K_MEMINTRINSIC},
+      {"llvm.memset", K_MEMINTRINSIC},
+      // Bitcast: int <-> FP (same size). Pointer<->pointer bitcasts are
+      // gone with opaque pointers.
+      {"bitcast", K_BITCAST},
       // powi: (FP Val, i32 power) -> FP. Slot 1 is i32 regardless of
       // primary FP type; typeCombosForEdge has a special branch for that.
       {"llvm.powi", K_POWI_INTRINSIC},
@@ -444,10 +496,18 @@ bool isFPKind(Kind k) {
     case K_FP_CAST:
     case K_POWI_INTRINSIC:
     case K_FPCLASS_INTRINSIC:
+    case K_VECTOR_REDUCE_FOLD:
       return true;
     default:
       return false;
   }
+}
+
+bool isFPVectorReduce(const std::string &inst_name) {
+  return inst_name == "llvm.vector.reduce.fmax" ||
+         inst_name == "llvm.vector.reduce.fmin" ||
+         inst_name == "llvm.vector.reduce.fmaximum" ||
+         inst_name == "llvm.vector.reduce.fminimum";
 }
 
 // Cast-like kinds carry distinct (in, out) types and use a hardcoded
@@ -460,6 +520,7 @@ bool isCastKind(Kind k) {
     case K_FP_CAST:
     case K_FPTOI_SAT:
     case K_CMP_INTRINSIC:
+    case K_BITCAST:
       return true;
     default:
       return false;
@@ -480,6 +541,8 @@ std::string fmfPrefix(const Rule &rule) {
 }
 
 std::string typedZero(const std::string &ty) {
+  if (ty == "ptr") return "null";
+  if (!ty.empty() && ty[0] == '<') return "zeroinitializer";
   if (isFP(ty)) return "0.0";
   return "0";
 }
@@ -511,6 +574,15 @@ int numValueSlots(Kind k) {
     case K_POWI_INTRINSIC: return 2;          // Val (FP), power (i32)
     case K_FPCLASS_INTRINSIC: return 1;       // op (test is immarg)
     case K_FPTOI_SAT: return 1;
+    case K_BITCAST: return 1;
+    case K_GEP: return 2;                     // ptrval, idx
+    case K_LOAD: return 1;                    // pointer
+    case K_STORE: return 2;                   // value, pointer
+    case K_MEMINTRINSIC: return 3;            // dest, src/val, len
+    case K_EXTRACTELEMENT: return 2;          // vector, idx
+    case K_INSERTELEMENT: return 3;           // vector, scalar elt, idx
+    case K_VECTOR_REDUCE: return 1;           // <4 x T>
+    case K_VECTOR_REDUCE_FOLD: return 2;      // start (T), <4 x T>
     default: return 0;
   }
 }
@@ -519,11 +591,43 @@ int numValueSlots(Kind k) {
 // slot; the exceptions are select.cond (always i1), cast ops whose
 // single operand is the cast's source type (= in_type), and powi's
 // power slot (always i32 regardless of the primary FP type).
-std::string slotType(Kind k, int slot, const std::string &in_type,
+std::string slotType(Kind k, const std::string &inst_name, int slot,
+                     const std::string &in_type,
                      const std::string &out_type) {
   (void)out_type;
   if (k == K_SELECT && slot == 0) return "i1";
   if (k == K_POWI_INTRINSIC && slot == 1) return "i32";
+  if (k == K_GEP) {
+    if (slot == 0) return "ptr";
+    if (slot == 1) return "i64";
+  }
+  if (k == K_LOAD) return "ptr";
+  if (k == K_STORE) {
+    if (slot == 0) return in_type;
+    if (slot == 1) return "ptr";
+  }
+  if (k == K_MEMINTRINSIC) {
+    if (slot == 0) return "ptr";
+    if (slot == 1) {
+      if (inst_name == "llvm.memset") return "i8";
+      return "ptr";  // memcpy/memmove src
+    }
+    if (slot == 2) return "i64";
+  }
+  if (k == K_EXTRACTELEMENT) {
+    if (slot == 0) return "<4 x " + in_type + ">";
+    if (slot == 1) return "i32";
+  }
+  if (k == K_INSERTELEMENT) {
+    if (slot == 0) return "<4 x " + in_type + ">";
+    if (slot == 1) return in_type;
+    if (slot == 2) return "i32";
+  }
+  if (k == K_VECTOR_REDUCE) return "<4 x " + in_type + ">";
+  if (k == K_VECTOR_REDUCE_FOLD) {
+    if (slot == 0) return in_type;
+    if (slot == 1) return "<4 x " + in_type + ">";
+  }
   return in_type;
 }
 
@@ -531,10 +635,25 @@ std::string slotType(Kind k, int slot, const std::string &in_type,
 // and either works. K_CAST returns out_type (the cast destination).
 // K_ICMP / K_FCMP / K_FPCLASS_INTRINSIC are always i1 regardless of the
 // operand type. K_POWI_INTRINSIC returns the FP primary type (in_type).
+// K_GEP returns ptr. K_LOAD returns the element type (in_type).
+// K_STORE / K_MEMINTRINSIC have void as the textual result; composeEdge
+// generates a load-back epilogue for K_STORE and emits ret void for
+// K_MEMINTRINSIC, so the value we return here is only used for the SSA
+// connection check on the source side (where these kinds never appear).
+// K_VECTOR_REDUCE / K_VECTOR_REDUCE_FOLD return the element type.
+// K_EXTRACTELEMENT returns the element type. K_INSERTELEMENT returns
+// <4 x element>.
 std::string resultType(Kind k, const std::string &in_type,
                        const std::string &out_type) {
   if (k == K_ICMP || k == K_FCMP || k == K_FPCLASS_INTRINSIC) return "i1";
   if (k == K_POWI_INTRINSIC) return in_type;
+  if (k == K_GEP) return "ptr";
+  if (k == K_LOAD) return in_type;
+  if (k == K_STORE) return "void";
+  if (k == K_MEMINTRINSIC) return "void";
+  if (k == K_VECTOR_REDUCE || k == K_VECTOR_REDUCE_FOLD) return in_type;
+  if (k == K_EXTRACTELEMENT) return in_type;
+  if (k == K_INSERTELEMENT) return "<4 x " + in_type + ">";
   (void)in_type;
   return out_type;
 }
@@ -558,13 +677,48 @@ int operandToSlot(Kind k, int op_idx) {
     if (op_idx == 2) return 1;
     return -1;
   }
-  if (k == K_CAST || k == K_FP_INT_CAST || k == K_FP_CAST || k == K_FPTOI_SAT)
+  if (k == K_CAST || k == K_FP_INT_CAST || k == K_FP_CAST ||
+      k == K_FPTOI_SAT || k == K_BITCAST)
     return op_idx == 0 ? 0 : -1;
   // Fixed-point intrinsics: operand 2 is the i32 immarg scale; only
   // operands 0 and 1 are value slots.
   if (k == K_FIXED_POINT_INTRINSIC) return op_idx < 2 ? op_idx : -1;
   // is.fpclass: operand 1 is the i32 immarg test mask.
   if (k == K_FPCLASS_INTRINSIC) return op_idx == 0 ? 0 : -1;
+  // GEP rule operands: 0=ty (type, not a value), 1=ptrval, 2=indices.
+  if (k == K_GEP) {
+    if (op_idx == 1) return 0;
+    if (op_idx == 2) return 1;
+    return -1;
+  }
+  // Load rule operands: 0=ty (type), 1=pointer, 2=alignment, 3=ordering.
+  if (k == K_LOAD) {
+    if (op_idx == 1) return 0;
+    return -1;
+  }
+  // Store rule operands: 0=value, 1=pointer, 2=alignment, 3=ordering.
+  if (k == K_STORE) {
+    if (op_idx == 0) return 0;
+    if (op_idx == 1) return 1;
+    return -1;
+  }
+  // Memcpy/move rule operands: 0=dest, 1=src, 2=len, 3=isvolatile.
+  // Memset rule operands: 0=dest, 1=val, 2=len, 3=isvolatile.
+  if (k == K_MEMINTRINSIC) {
+    if (op_idx >= 0 && op_idx <= 2) return op_idx;
+    return -1;  // 3=isvolatile is immarg
+  }
+  // extractelement: 0=val (vector), 1=idx.
+  if (k == K_EXTRACTELEMENT) return op_idx < 2 ? op_idx : -1;
+  // insertelement: 0=val (vector), 1=elt (scalar), 2=idx.
+  if (k == K_INSERTELEMENT) return op_idx < 3 ? op_idx : -1;
+  // Vector reductions: one value operand. fadd/fmul fold has 2 ops
+  // (start_value=0, vector=1).
+  if (k == K_VECTOR_REDUCE) return op_idx == 0 ? 0 : -1;
+  if (k == K_VECTOR_REDUCE_FOLD) {
+    if (op_idx == 0 || op_idx == 1) return op_idx;
+    return -1;
+  }
   int n = numValueSlots(k);
   return (op_idx >= 0 && op_idx < n) ? op_idx : -1;
 }
@@ -575,7 +729,18 @@ int operandToSlot(Kind k, int op_idx) {
 // accept either side — their (src, dst) pair list is the real filter.
 bool supportsType(Kind k, const std::string &inst_name,
                   const std::string &T) {
-  if (k == K_FP_INT_CAST || k == K_FPTOI_SAT) return isFP(T) || isInt(T);
+  if (k == K_FP_INT_CAST || k == K_FPTOI_SAT || k == K_BITCAST)
+    return isFP(T) || isInt(T);
+  if (k == K_VECTOR_REDUCE) {
+    return isFPVectorReduce(inst_name) ? isFP(T) : isInt(T);
+  }
+  // Memory kinds: T is the element type. Accept int and FP scalar
+  // element types. For K_MEMINTRINSIC the T is mostly inert (slots are
+  // ptr/i8/i64); accept any scalar so the connection check can match.
+  if (k == K_GEP || k == K_LOAD || k == K_STORE || k == K_MEMINTRINSIC)
+    return isInt(T) || isFP(T);
+  if (k == K_EXTRACTELEMENT || k == K_INSERTELEMENT)
+    return isInt(T) || isFP(T);
   if (isFPKind(k)) return isFP(T);
   if (!isInt(T)) return false;
   if (inst_name == "llvm.bswap") {
@@ -646,8 +811,21 @@ castPairs(const std::string &inst_name) {
   static const std::vector<std::pair<std::string, std::string>> kFpToISat = {
       {"float", "i32"}, {"double", "i64"}, {"float", "i64"}, {"double", "i32"},
   };
+  // lround/lrint: result is i32 or i64 (platform "long").
+  static const std::vector<std::pair<std::string, std::string>> kLround = {
+      {"float", "i32"}, {"double", "i64"}, {"float", "i64"}, {"double", "i32"},
+  };
+  // llround/llrint: result is always i64.
+  static const std::vector<std::pair<std::string, std::string>> kLLround = {
+      {"float", "i64"}, {"double", "i64"},
+  };
   static const std::vector<std::pair<std::string, std::string>> kCmpIntr = {
       {"i32", "i8"}, {"i64", "i8"},
+  };
+  // Bitcast: same bit-size between int and FP (and the symmetric pair).
+  static const std::vector<std::pair<std::string, std::string>> kBitcast = {
+      {"i32", "float"}, {"float", "i32"},
+      {"i64", "double"}, {"double", "i64"},
   };
   static const std::vector<std::pair<std::string, std::string>> kEmpty;
   if (inst_name == "trunc") return kTrunc;
@@ -658,7 +836,10 @@ castPairs(const std::string &inst_name) {
   if (inst_name == "fptrunc") return kFpTrunc;
   if (inst_name == "llvm.fptoui.sat" || inst_name == "llvm.fptosi.sat")
     return kFpToISat;
+  if (inst_name == "llvm.lround" || inst_name == "llvm.lrint") return kLround;
+  if (inst_name == "llvm.llround" || inst_name == "llvm.llrint") return kLLround;
   if (inst_name == "llvm.scmp" || inst_name == "llvm.ucmp") return kCmpIntr;
+  if (inst_name == "bitcast") return kBitcast;
   return kEmpty;
 }
 
@@ -671,9 +852,17 @@ castPairs(const std::string &inst_name) {
 bool ruleAppliesAtT(Kind k, const Rule &rule, const std::string &T) {
   (void)T;
   const std::string &id = rule.id;
-  if (id.find("vector") != std::string::npos) return false;
+  // Some new kinds have rule IDs that legitimately contain "vector" /
+  // "pointer" — namely vector reductions / extract / insert (vector) and
+  // load / store / gep / memintrinsic (pointer). Skip the wholesale id
+  // filter for those.
+  bool vector_kind = (k == K_VECTOR_REDUCE || k == K_VECTOR_REDUCE_FOLD ||
+                      k == K_EXTRACTELEMENT || k == K_INSERTELEMENT);
+  bool memory_kind = (k == K_GEP || k == K_LOAD || k == K_STORE ||
+                      k == K_MEMINTRINSIC);
+  if (!vector_kind && id.find("vector") != std::string::npos) return false;
+  if (!memory_kind && id.find("pointer") != std::string::npos) return false;
   if (id.find("fmf") != std::string::npos) return false;
-  if (id.find("pointer") != std::string::npos) return false;
   if (id.find("byte") != std::string::npos) return false;
   if (id.find("aggregate") != std::string::npos) return false;
   // freeze.defined.pointer_nondereferenceable, etc. — already covered
@@ -688,6 +877,22 @@ bool ruleAppliesAtT(Kind k, const Rule &rule, const std::string &T) {
     // .from_i1 needs i1 as the cast source; our pair list doesn't include
     // i1, so the type filter would already drop these. Skip explicitly.
     if (id.find(".from_i1") != std::string::npos) return false;
+  }
+  // Memory-op rules with metadata flags (!nonnull, !align, !noundef,
+  // !invariant.load) — we don't emit metadata so these can't be
+  // distinguished from the base case. Skip rather than silently
+  // collapsing them onto base.
+  if (k == K_LOAD || k == K_STORE) {
+    if (rule.flag.has_value()) {
+      const std::string &f = *rule.flag;
+      if (!f.empty() && f[0] == '!') return false;
+      if (f == "volatile" || f == "atomic") return false;
+    }
+  }
+  if (k == K_GEP) {
+    // inrange is restricted to constant GEP expressions; not applicable
+    // to runtime GEP instructions.
+    if (rule.flag.has_value() && *rule.flag == "inrange") return false;
   }
   return true;
 }
@@ -935,6 +1140,8 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
     case K_FPTOI_SAT: {
       // Two-suffix mangling: result int type then source FP type.
       // Example: @llvm.fptoui.sat.i32.f32(float %x) -> i32.
+      // Shared with llvm.lround/llvm.llround/llvm.lrint/llvm.llrint, which
+      // use the same (result, source) mangling convention.
       const std::string src_suffix = intrinsicSuffix(in_type);
       if (src_suffix.empty() || !isInt(out_type)) return {};
       const std::string call = std::string("@") + inst_name + "." + out_type +
@@ -942,6 +1149,92 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
       decls.insert("declare " + out_type + " " + call + "(" + in_type + ")");
       return result_var + " = call " + out_type + " " + call + "(" + in_type +
              " " + slot_vars[0] + ")";
+    }
+    case K_BITCAST: {
+      // Int <-> FP same-size bitcast. No flags. Pointer<->pointer bitcasts
+      // are invalid under opaque pointers (LLVM 17+).
+      if (rule.flag.has_value()) return {};
+      if (in_type == out_type) return {};
+      return result_var + " = bitcast " + in_type + " " + slot_vars[0] +
+             " to " + out_type;
+    }
+    case K_GEP: {
+      // getelementptr [flag] T, ptr %base, i64 %idx. Single-index form.
+      // Flags supported here: inbounds, nuw, nusw. inrange is constant-
+      // only and filtered upstream.
+      std::string flag_str;
+      if (rule.flag.has_value()) {
+        const std::string &f = *rule.flag;
+        if (f == "inbounds") flag_str = "inbounds ";
+        else if (f == "nuw") flag_str = "nuw ";
+        else if (f == "nusw") flag_str = "nusw ";
+        else return {};
+      }
+      return result_var + " = getelementptr " + flag_str + T + ", ptr " +
+             slot_vars[0] + ", i64 " + slot_vars[1];
+    }
+    case K_LOAD: {
+      // load T, ptr %p. Metadata flags filtered upstream.
+      return result_var + " = load " + T + ", ptr " + slot_vars[0];
+    }
+    case K_STORE: {
+      // Void-producing. Emit the store; composeEdge appends the load-back
+      // and ret on the target side.
+      return std::string("store ") + T + " " + slot_vars[0] + ", ptr " +
+             slot_vars[1];
+    }
+    case K_MEMINTRINSIC: {
+      // memcpy/memmove signature: (ptr dest, ptr src, i64 len, i1 immarg).
+      // memset signature: (ptr dest, i8 val, i64 len, i1 immarg).
+      // Mangling: @llvm.memcpy.p0.p0.i64 / @llvm.memset.p0.i64.
+      bool is_set = (inst_name == "llvm.memset");
+      std::string sig_op1 = is_set ? "i8" : "ptr";
+      std::string mangle = is_set ? ".p0.i64" : ".p0.p0.i64";
+      const std::string call = std::string("@") + inst_name + mangle;
+      decls.insert("declare void " + call + "(ptr, " + sig_op1 +
+                   ", i64, i1 immarg)");
+      return std::string("call void ") + call + "(ptr " + slot_vars[0] +
+             ", " + sig_op1 + " " + slot_vars[1] + ", i64 " + slot_vars[2] +
+             ", i1 false)";
+    }
+    case K_EXTRACTELEMENT: {
+      // %a = extractelement <4 x T> %v, i32 %idx
+      if (!isInt(T) && !isFP(T)) return {};
+      const std::string vt = "<4 x " + T + ">";
+      return result_var + " = extractelement " + vt + " " + slot_vars[0] +
+             ", i32 " + slot_vars[1];
+    }
+    case K_INSERTELEMENT: {
+      // %a = insertelement <4 x T> %v, T %elt, i32 %idx
+      if (!isInt(T) && !isFP(T)) return {};
+      const std::string vt = "<4 x " + T + ">";
+      return result_var + " = insertelement " + vt + " " + slot_vars[0] +
+             ", " + T + " " + slot_vars[1] + ", i32 " + slot_vars[2];
+    }
+    case K_VECTOR_REDUCE: {
+      // (<4 x T>) -> T. Mangling suffix: v4<elem-suffix>. Int reductions
+      // do not carry FMF; FP reductions (fmax/fmin/fmaximum/fminimum) do.
+      const std::string elem_suffix = intrinsicSuffix(T);
+      if (elem_suffix.empty()) return {};
+      const std::string vt = "<4 x " + T + ">";
+      const std::string suffix = "v4" + elem_suffix;
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare " + T + " " + call + "(" + vt + ")");
+      std::string fmf = isFPVectorReduce(inst_name) ? fmfPrefix(rule) : "";
+      return result_var + " = call " + fmf + T + " " + call + "(" + vt +
+             " " + slot_vars[0] + ")";
+    }
+    case K_VECTOR_REDUCE_FOLD: {
+      // (T start, <4 x T>) -> T. fadd/fmul. FMF allowed.
+      const std::string elem_suffix = intrinsicSuffix(T);
+      if (elem_suffix.empty()) return {};
+      const std::string vt = "<4 x " + T + ">";
+      const std::string suffix = "v4" + elem_suffix;
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare " + T + " " + call + "(" + T + ", " + vt + ")");
+      return result_var + " = call " + fmfPrefix(rule) + T + " " + call +
+             "(" + T + " " + slot_vars[0] + ", " + vt + " " + slot_vars[1] +
+             ")";
     }
     default:
       return {};
@@ -986,6 +1279,13 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
   Kind tk = kindOf(tgt_rule.instruction);
   if (sk == K_UNSUPPORTED || tk == K_UNSUPPORTED) return std::nullopt;
 
+  // Void-producing kinds and the insertelement target-only kind can't
+  // serve as the source. The matrix should already exclude them (no
+  // storable result), but reject defensively so an unexpected edge
+  // fails closed.
+  if (sk == K_STORE || sk == K_MEMINTRINSIC || sk == K_INSERTELEMENT)
+    return std::nullopt;
+
   // For non-cast kinds, supportsType only sees one type. For casts, both
   // src and dst must satisfy whatever per-kind width constraints apply.
   if (!supportsType(sk, src_rule.instruction, a.in)) return std::nullopt;
@@ -998,10 +1298,15 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
 
   if (target_slot < 0 || target_slot >= numValueSlots(tk)) return std::nullopt;
 
-  // Type match at the connection point.
+  // Type match at the connection point. K_GEP target with the index slot
+  // is special: A's int can be any width; we sext to i64 at compose time.
   const std::string src_result = resultType(sk, a.in, a.out);
-  const std::string tgt_slot_t = slotType(tk, target_slot, b.in, b.out);
-  if (src_result != tgt_slot_t) return std::nullopt;
+  const std::string tgt_slot_t =
+      slotType(tk, tgt_rule.instruction, target_slot, b.in, b.out);
+  const bool gep_idx_sext =
+      (tk == K_GEP && target_slot == 1 && isInt(src_result) &&
+       widthOf(src_result) > 0 && widthOf(src_result) < 64);
+  if (!gep_idx_sext && src_result != tgt_slot_t) return std::nullopt;
 
   const int n_src_slots = numValueSlots(sk);
   const int n_tgt_slots = numValueSlots(tk);
@@ -1016,17 +1321,21 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
   int next_p = 0;
   for (int i = 0; i < n_src_slots; ++i) {
     src_slots[i] = varName(next_p++);
-    param_types.push_back(slotType(sk, i, a.in, a.out));
+    param_types.push_back(slotType(sk, src_rule.instruction, i, a.in, a.out));
     param_vars.push_back(src_slots[i]);
   }
-  // The variable holding A's result that target B will consume.
+  // The variable holding A's result that target B will consume. For
+  // memory edges A's value is round-tripped through alloca+store+load
+  // (%ld); for SSA and control edges it stays as %a. For the GEP-index
+  // sext path the index slot receives %a_ext instead.
   const std::string a_value = (edge_type == "memory") ? "%ld" : "%a";
   for (int i = 0; i < n_tgt_slots; ++i) {
     if (i == target_slot) {
-      tgt_slots[i] = a_value;
+      tgt_slots[i] = gep_idx_sext ? "%a_ext" : a_value;
     } else {
       tgt_slots[i] = varName(next_p++);
-      param_types.push_back(slotType(tk, i, b.in, b.out));
+      param_types.push_back(
+          slotType(tk, tgt_rule.instruction, i, b.in, b.out));
       param_vars.push_back(tgt_slots[i]);
     }
   }
@@ -1039,9 +1348,51 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
                                         "%b", b.in, b.out, tgt_slots, decls);
   if (b_insn.empty()) return std::nullopt;
 
-  const std::string ret_type = resultType(tk, b.in, b.out);
-  // Memory edge stores/loads A's result type (which equals B's input at
-  // the connection point per the type-match check above).
+  // Determine the function return type and the variable holding the
+  // returned value. For K_STORE and K_GEP targets we synthesize a
+  // load-back of the element type so the composition has something to
+  // return; K_MEMINTRINSIC returns void.
+  std::string ret_type;
+  std::string ret_var;
+  std::string epilogue;
+  if (tk == K_STORE) {
+    ret_type = b.in;
+    ret_var = "%val";
+    // tgt_slots[1] is the store pointer (a parameter, or %ld for memory
+    // edge — but K_STORE as target with target_slot=1 would be feeding
+    // the pointer from A; we keep the load-back tied to whichever slot
+    // ends up holding the pointer).
+    const std::string &storeptr = tgt_slots[1];
+    epilogue = "%val = load " + b.in + ", ptr " + storeptr;
+  } else if (tk == K_GEP) {
+    ret_type = b.in;
+    ret_var = "%val";
+    epilogue = "%val = load " + b.in + ", ptr %b";
+  } else if (tk == K_MEMINTRINSIC) {
+    ret_type = "void";
+    ret_var = "";
+  } else {
+    ret_type = resultType(tk, b.in, b.out);
+    ret_var = "%b";
+  }
+
+  // GEP-target sext line: convert A's narrower int to i64.
+  std::string sext_line;
+  if (gep_idx_sext) {
+    sext_line = "%a_ext = sext " + src_result + " " + a_value + " to i64";
+  }
+
+  // Helper: emit the return instruction. For void return, no value.
+  auto emitRet = [&](std::ostream &out, const std::string &val) {
+    if (ret_type == "void") {
+      out << "  ret void\n";
+    } else {
+      out << "  ret " << ret_type << " " << val << "\n";
+    }
+  };
+
+  // Memory edge stores/loads A's result type. ptr-typed A (e.g. K_GEP)
+  // round-trips through `alloca ptr`.
   const std::string &mem_t = src_result;
 
   std::ostringstream os;
@@ -1058,16 +1409,19 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
     os << "  " << a_insn << "\n";
     os << "  store " << mem_t << " %a, ptr %p\n";
     os << "  %ld = load " << mem_t << ", ptr %p\n";
+    if (!sext_line.empty()) os << "  " << sext_line << "\n";
     os << "  " << b_insn << "\n";
-    os << "  ret " << ret_type << " %b\n";
+    if (!epilogue.empty()) os << "  " << epilogue << "\n";
+    emitRet(os, ret_var);
   } else if (edge_type == "control") {
     // Multi-BB: A's value gates B's execution via a comparison + br.
     // In the then branch %a is non-zero (and not poison, since poison
     // through icmp+br would be UB at the branch). B can still use %a in
     // its target slot because entry dominates then. FP sources use
-    // "fcmp une <T> %a, 0.0" instead of icmp. K_OVERFLOW_INTRINSIC has
-    // its own bit in the struct — extract and branch on it directly so
-    // the optimizer can infer no-overflow in the taken branch.
+    // "fcmp une <T> %a, 0.0" instead of icmp; ptr sources use
+    // "icmp ne ptr %a, null". K_OVERFLOW_INTRINSIC has its own bit in
+    // the struct — extract and branch on it directly so the optimizer
+    // can infer no-overflow in the taken branch.
     const std::string &a_t = src_result;
     os << "entry:\n";
     os << "  " << a_insn << "\n";
@@ -1075,10 +1429,12 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
       os << "  %a_obit = extractvalue {" << a_t << ", i1} %a_res, 1\n";
       os << "  br i1 %a_obit, label %overflow, label %normal\n";
       os << "normal:\n";
+      if (!sext_line.empty()) os << "  " << sext_line << "\n";
       os << "  " << b_insn << "\n";
-      os << "  ret " << ret_type << " %b\n";
+      if (!epilogue.empty()) os << "  " << epilogue << "\n";
+      emitRet(os, ret_var);
       os << "overflow:\n";
-      os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
+      emitRet(os, ret_type == "void" ? "" : typedZero(ret_type));
     } else {
       if (a_t == "i1") {
         // %a is already i1; skip the redundant comparison.
@@ -1086,20 +1442,27 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
       } else if (isFP(a_t)) {
         os << "  %cond = fcmp une " << a_t << " %a, 0.0\n";
         os << "  br i1 %cond, label %then, label %else\n";
+      } else if (a_t == "ptr") {
+        os << "  %cond = icmp ne ptr %a, null\n";
+        os << "  br i1 %cond, label %then, label %else\n";
       } else {
         os << "  %cond = icmp ne " << a_t << " %a, 0\n";
         os << "  br i1 %cond, label %then, label %else\n";
       }
       os << "then:\n";
+      if (!sext_line.empty()) os << "  " << sext_line << "\n";
       os << "  " << b_insn << "\n";
-      os << "  ret " << ret_type << " %b\n";
+      if (!epilogue.empty()) os << "  " << epilogue << "\n";
+      emitRet(os, ret_var);
       os << "else:\n";
-      os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
+      emitRet(os, ret_type == "void" ? "" : typedZero(ret_type));
     }
   } else {
     os << "  " << a_insn << "\n";
+    if (!sext_line.empty()) os << "  " << sext_line << "\n";
     os << "  " << b_insn << "\n";
-    os << "  ret " << ret_type << " %b\n";
+    if (!epilogue.empty()) os << "  " << epilogue << "\n";
+    emitRet(os, ret_var);
   }
   os << "}\n";
 
@@ -1289,7 +1652,7 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
   const bool b_cast = isCastKind(tk);
 
   auto tgtSlotType = [&](const std::string &b_in, const std::string &b_out) {
-    return slotType(tk, target_slot, b_in, b_out);
+    return slotType(tk, tgt_name, target_slot, b_in, b_out);
   };
   auto srcResultType = [&](const std::string &a_in, const std::string &a_out) {
     return resultType(sk, a_in, a_out);
@@ -1317,6 +1680,28 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
         if (!supportsType(sk, src_name, "i32")) continue;
         SideType A{"i32", "i32"};
         if (srcResultType(A.in, A.out) != "i32") continue;
+        out.push_back({A, B});
+      }
+    }
+    return out;
+  }
+
+  // Special-case: K_GEP's index slot is i64. A narrower int produced by
+  // A is sext'd to i64 in composeEdge, so enumerate over all int Ts (B's
+  // element type tracks A's int output type for naming consistency).
+  if (tk == K_GEP && target_slot == 1) {
+    if (a_cast) {
+      for (const auto &pa : castPairs(src_name)) {
+        SideType A{pa.first, pa.second};
+        if (!isInt(A.out)) continue;
+        SideType B{A.out, A.out};
+        out.push_back({A, B});
+      }
+    } else {
+      for (const auto &T : requested_types) {
+        if (!isInt(T)) continue;
+        if (!supportsType(sk, src_name, T)) continue;
+        SideType A{T, T}, B{T, T};
         out.push_back({A, B});
       }
     }
