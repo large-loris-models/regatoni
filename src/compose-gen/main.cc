@@ -224,6 +224,7 @@ enum Kind {
   K_BINARY_INTRINSIC,
   K_TERNARY_INTRINSIC,
   K_INTRINSIC_WITH_FLAG,
+  K_OVERFLOW_INTRINSIC,
   K_FREEZE,
   K_SELECT,
   K_ICMP,
@@ -247,6 +248,7 @@ const char *kindName(Kind k) {
     case K_BINARY_INTRINSIC: return "binary_intrinsic";
     case K_TERNARY_INTRINSIC: return "ternary_intrinsic";
     case K_INTRINSIC_WITH_FLAG: return "intrinsic_with_flag";
+    case K_OVERFLOW_INTRINSIC: return "overflow_intrinsic";
     case K_FREEZE: return "freeze";
     case K_SELECT: return "select";
     case K_ICMP: return "icmp";
@@ -293,6 +295,15 @@ Kind kindOf(const std::string &name) {
       {"llvm.cttz", K_INTRINSIC_WITH_FLAG},
       {"llvm.ctlz", K_INTRINSIC_WITH_FLAG},
       {"llvm.abs", K_INTRINSIC_WITH_FLAG},
+      // Overflow intrinsics: (iN, iN) -> {iN, i1}. Always emitted with an
+      // extractvalue 0 to expose the iN result; control edges also extract
+      // element 1 for the overflow bit.
+      {"llvm.sadd.with.overflow", K_OVERFLOW_INTRINSIC},
+      {"llvm.uadd.with.overflow", K_OVERFLOW_INTRINSIC},
+      {"llvm.ssub.with.overflow", K_OVERFLOW_INTRINSIC},
+      {"llvm.usub.with.overflow", K_OVERFLOW_INTRINSIC},
+      {"llvm.smul.with.overflow", K_OVERFLOW_INTRINSIC},
+      {"llvm.umul.with.overflow", K_OVERFLOW_INTRINSIC},
       // Integer casts
       {"trunc", K_CAST},
       {"zext", K_CAST},
@@ -416,6 +427,7 @@ int numValueSlots(Kind k) {
     case K_UNARY_INTRINSIC: return 1;
     case K_TERNARY_INTRINSIC: return 3;
     case K_INTRINSIC_WITH_FLAG: return 1;
+    case K_OVERFLOW_INTRINSIC: return 2;
     case K_FREEZE: return 1;
     case K_SELECT: return 3;
     case K_ICMP: return 2;
@@ -652,6 +664,19 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
       return result_var + " = call " + T + " " + call + "(" + T + " " +
              slot_vars[0] + ", i1 " + (fv ? "true" : "false") + ")";
     }
+    case K_OVERFLOW_INTRINSIC: {
+      // Two-line emission: the struct-returning call, then extractvalue 0
+      // to expose the iN result on `result_var`. The struct itself lives
+      // on `result_var + "_res"`, which composeEdge reaches into for the
+      // overflow-bit extract on control edges. result_var is "%a" or "%b"
+      // (with leading %), so res_var is "%a_res" / "%b_res".
+      const std::string call = std::string("@") + inst_name + "." + T;
+      decls.insert("declare {" + T + ", i1} " + call + "(" + T + ", " + T + ")");
+      const std::string res_var = result_var + "_res";
+      return res_var + " = call {" + T + ", i1} " + call + "(" + T + " " +
+             slot_vars[0] + ", " + T + " " + slot_vars[1] + ")\n  " +
+             result_var + " = extractvalue {" + T + ", i1} " + res_var + ", 0";
+    }
     case K_FREEZE:
       return result_var + " = freeze " + T + " " + slot_vars[0];
     case K_SELECT:
@@ -849,25 +874,37 @@ composeEdge(const Rule &src_rule, const Rule &tgt_rule, int target_slot,
     // In the then branch %a is non-zero (and not poison, since poison
     // through icmp+br would be UB at the branch). B can still use %a in
     // its target slot because entry dominates then. FP sources use
-    // "fcmp une <T> %a, 0.0" instead of icmp.
+    // "fcmp une <T> %a, 0.0" instead of icmp. K_OVERFLOW_INTRINSIC has
+    // its own bit in the struct — extract and branch on it directly so
+    // the optimizer can infer no-overflow in the taken branch.
     const std::string &a_t = src_result;
     os << "entry:\n";
     os << "  " << a_insn << "\n";
-    if (a_t == "i1") {
-      // %a is already i1; skip the redundant comparison.
-      os << "  br i1 %a, label %then, label %else\n";
-    } else if (isFP(a_t)) {
-      os << "  %cond = fcmp une " << a_t << " %a, 0.0\n";
-      os << "  br i1 %cond, label %then, label %else\n";
+    if (sk == K_OVERFLOW_INTRINSIC) {
+      os << "  %a_obit = extractvalue {" << a_t << ", i1} %a_res, 1\n";
+      os << "  br i1 %a_obit, label %overflow, label %normal\n";
+      os << "normal:\n";
+      os << "  " << b_insn << "\n";
+      os << "  ret " << ret_type << " %b\n";
+      os << "overflow:\n";
+      os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
     } else {
-      os << "  %cond = icmp ne " << a_t << " %a, 0\n";
-      os << "  br i1 %cond, label %then, label %else\n";
+      if (a_t == "i1") {
+        // %a is already i1; skip the redundant comparison.
+        os << "  br i1 %a, label %then, label %else\n";
+      } else if (isFP(a_t)) {
+        os << "  %cond = fcmp une " << a_t << " %a, 0.0\n";
+        os << "  br i1 %cond, label %then, label %else\n";
+      } else {
+        os << "  %cond = icmp ne " << a_t << " %a, 0\n";
+        os << "  br i1 %cond, label %then, label %else\n";
+      }
+      os << "then:\n";
+      os << "  " << b_insn << "\n";
+      os << "  ret " << ret_type << " %b\n";
+      os << "else:\n";
+      os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
     }
-    os << "then:\n";
-    os << "  " << b_insn << "\n";
-    os << "  ret " << ret_type << " %b\n";
-    os << "else:\n";
-    os << "  ret " << ret_type << " " << typedZero(ret_type) << "\n";
   } else {
     os << "  " << a_insn << "\n";
     os << "  " << b_insn << "\n";
