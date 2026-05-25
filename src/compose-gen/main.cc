@@ -225,6 +225,8 @@ enum Kind {
   K_TERNARY_INTRINSIC,
   K_INTRINSIC_WITH_FLAG,
   K_OVERFLOW_INTRINSIC,
+  K_FIXED_POINT_INTRINSIC,
+  K_CMP_INTRINSIC,
   K_FREEZE,
   K_SELECT,
   K_ICMP,
@@ -237,6 +239,11 @@ enum Kind {
   K_FP_BINARY_INTRINSIC,
   K_FP_TERNARY_INTRINSIC,
   K_FCMP,
+  K_FP_INT_CAST,
+  K_FP_CAST,
+  K_POWI_INTRINSIC,
+  K_FPCLASS_INTRINSIC,
+  K_FPTOI_SAT,
   K_UNSUPPORTED,
 };
 
@@ -249,6 +256,8 @@ const char *kindName(Kind k) {
     case K_TERNARY_INTRINSIC: return "ternary_intrinsic";
     case K_INTRINSIC_WITH_FLAG: return "intrinsic_with_flag";
     case K_OVERFLOW_INTRINSIC: return "overflow_intrinsic";
+    case K_FIXED_POINT_INTRINSIC: return "fixed_point_intrinsic";
+    case K_CMP_INTRINSIC: return "cmp_intrinsic";
     case K_FREEZE: return "freeze";
     case K_SELECT: return "select";
     case K_ICMP: return "icmp";
@@ -261,6 +270,11 @@ const char *kindName(Kind k) {
     case K_FP_BINARY_INTRINSIC: return "fp_binary_intrinsic";
     case K_FP_TERNARY_INTRINSIC: return "fp_ternary_intrinsic";
     case K_FCMP: return "fcmp";
+    case K_FP_INT_CAST: return "fp_int_cast";
+    case K_FP_CAST: return "fp_cast";
+    case K_POWI_INTRINSIC: return "powi_intrinsic";
+    case K_FPCLASS_INTRINSIC: return "fpclass_intrinsic";
+    case K_FPTOI_SAT: return "fptoi_sat";
     case K_UNSUPPORTED: return "unsupported";
   }
   return "?";
@@ -304,10 +318,43 @@ Kind kindOf(const std::string &name) {
       {"llvm.usub.with.overflow", K_OVERFLOW_INTRINSIC},
       {"llvm.smul.with.overflow", K_OVERFLOW_INTRINSIC},
       {"llvm.umul.with.overflow", K_OVERFLOW_INTRINSIC},
+      // Fixed-point intrinsics: (iN, iN, i32 immarg scale) -> iN. Scale is
+      // a constant immarg; the rule operand at index 2 is rejected by
+      // operandToSlot so target_op=2 edges are filtered upstream.
+      {"llvm.smul.fix", K_FIXED_POINT_INTRINSIC},
+      {"llvm.umul.fix", K_FIXED_POINT_INTRINSIC},
+      {"llvm.sdiv.fix", K_FIXED_POINT_INTRINSIC},
+      {"llvm.udiv.fix", K_FIXED_POINT_INTRINSIC},
+      {"llvm.smul.fix.sat", K_FIXED_POINT_INTRINSIC},
+      {"llvm.umul.fix.sat", K_FIXED_POINT_INTRINSIC},
+      {"llvm.sdiv.fix.sat", K_FIXED_POINT_INTRINSIC},
+      {"llvm.udiv.fix.sat", K_FIXED_POINT_INTRINSIC},
+      // Three-way comparison intrinsics: (iN, iN) -> i8. Result type is
+      // fixed at i8 so the kind is treated as cast-like (hardcoded
+      // operand-type/result-type pairs).
+      {"llvm.scmp", K_CMP_INTRINSIC},
+      {"llvm.ucmp", K_CMP_INTRINSIC},
       // Integer casts
       {"trunc", K_CAST},
       {"zext", K_CAST},
       {"sext", K_CAST},
+      // FP <-> integer conversions. Cross-type casts.
+      {"fptoui", K_FP_INT_CAST},
+      {"fptosi", K_FP_INT_CAST},
+      {"uitofp", K_FP_INT_CAST},
+      {"sitofp", K_FP_INT_CAST},
+      // FP precision casts.
+      {"fpext", K_FP_CAST},
+      {"fptrunc", K_FP_CAST},
+      // Saturating FP-to-int conversions: (FP) -> int, clamped.
+      {"llvm.fptoui.sat", K_FPTOI_SAT},
+      {"llvm.fptosi.sat", K_FPTOI_SAT},
+      // powi: (FP Val, i32 power) -> FP. Slot 1 is i32 regardless of
+      // primary FP type; typeCombosForEdge has a special branch for that.
+      {"llvm.powi", K_POWI_INTRINSIC},
+      // is.fpclass: (FP, i32 immarg test) -> i1. Slot 1 (test) is immarg
+      // and operandToSlot returns -1 for it.
+      {"llvm.is.fpclass", K_FPCLASS_INTRINSIC},
       // Misc
       {"freeze", K_FREEZE},
       {"select", K_SELECT},
@@ -394,6 +441,25 @@ bool isFPKind(Kind k) {
     case K_FP_BINARY_INTRINSIC:
     case K_FP_TERNARY_INTRINSIC:
     case K_FCMP:
+    case K_FP_CAST:
+    case K_POWI_INTRINSIC:
+    case K_FPCLASS_INTRINSIC:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Cast-like kinds carry distinct (in, out) types and use a hardcoded
+// (src, dst) pair list (castPairs) instead of being instantiated at the
+// requested-types T.
+bool isCastKind(Kind k) {
+  switch (k) {
+    case K_CAST:
+    case K_FP_INT_CAST:
+    case K_FP_CAST:
+    case K_FPTOI_SAT:
+    case K_CMP_INTRINSIC:
       return true;
     default:
       return false;
@@ -428,6 +494,8 @@ int numValueSlots(Kind k) {
     case K_TERNARY_INTRINSIC: return 3;
     case K_INTRINSIC_WITH_FLAG: return 1;
     case K_OVERFLOW_INTRINSIC: return 2;
+    case K_FIXED_POINT_INTRINSIC: return 2;  // a, b (scale is immarg)
+    case K_CMP_INTRINSIC: return 2;
     case K_FREEZE: return 1;
     case K_SELECT: return 3;
     case K_ICMP: return 2;
@@ -438,26 +506,35 @@ int numValueSlots(Kind k) {
     case K_FP_BINARY_INTRINSIC: return 2;
     case K_FP_TERNARY_INTRINSIC: return 3;
     case K_FCMP: return 2;
+    case K_FP_INT_CAST: return 1;
+    case K_FP_CAST: return 1;
+    case K_POWI_INTRINSIC: return 2;          // Val (FP), power (i32)
+    case K_FPCLASS_INTRINSIC: return 1;       // op (test is immarg)
+    case K_FPTOI_SAT: return 1;
     default: return 0;
   }
 }
 
 // Type of value slot `slot`. Most kinds use `in_type` for every value
-// slot; the exceptions are select.cond (always i1) and cast ops whose
-// single operand is the cast's source type (= in_type).
+// slot; the exceptions are select.cond (always i1), cast ops whose
+// single operand is the cast's source type (= in_type), and powi's
+// power slot (always i32 regardless of the primary FP type).
 std::string slotType(Kind k, int slot, const std::string &in_type,
                      const std::string &out_type) {
   (void)out_type;
   if (k == K_SELECT && slot == 0) return "i1";
+  if (k == K_POWI_INTRINSIC && slot == 1) return "i32";
   return in_type;
 }
 
 // Result type of this instruction. For most kinds in_type == out_type
 // and either works. K_CAST returns out_type (the cast destination).
-// K_ICMP / K_FCMP are always i1 regardless of the operand type.
+// K_ICMP / K_FCMP / K_FPCLASS_INTRINSIC are always i1 regardless of the
+// operand type. K_POWI_INTRINSIC returns the FP primary type (in_type).
 std::string resultType(Kind k, const std::string &in_type,
                        const std::string &out_type) {
-  if (k == K_ICMP || k == K_FCMP) return "i1";
+  if (k == K_ICMP || k == K_FCMP || k == K_FPCLASS_INTRINSIC) return "i1";
+  if (k == K_POWI_INTRINSIC) return in_type;
   (void)in_type;
   return out_type;
 }
@@ -481,16 +558,24 @@ int operandToSlot(Kind k, int op_idx) {
     if (op_idx == 2) return 1;
     return -1;
   }
-  if (k == K_CAST) return op_idx == 0 ? 0 : -1;
+  if (k == K_CAST || k == K_FP_INT_CAST || k == K_FP_CAST || k == K_FPTOI_SAT)
+    return op_idx == 0 ? 0 : -1;
+  // Fixed-point intrinsics: operand 2 is the i32 immarg scale; only
+  // operands 0 and 1 are value slots.
+  if (k == K_FIXED_POINT_INTRINSIC) return op_idx < 2 ? op_idx : -1;
+  // is.fpclass: operand 1 is the i32 immarg test mask.
+  if (k == K_FPCLASS_INTRINSIC) return op_idx == 0 ? 0 : -1;
   int n = numValueSlots(k);
   return (op_idx >= 0 && op_idx < n) ? op_idx : -1;
 }
 
 // Whether the instruction's pattern can be instantiated at T (or, for
 // casts, at the destination type T). FP kinds accept only float/double;
-// integer kinds accept only integer types.
+// integer kinds accept only integer types. Cross-type casts (FP↔int)
+// accept either side — their (src, dst) pair list is the real filter.
 bool supportsType(Kind k, const std::string &inst_name,
                   const std::string &T) {
+  if (k == K_FP_INT_CAST || k == K_FPTOI_SAT) return isFP(T) || isInt(T);
   if (isFPKind(k)) return isFP(T);
   if (!isInt(T)) return false;
   if (inst_name == "llvm.bswap") {
@@ -520,7 +605,9 @@ std::vector<int> controlSlotPriority(Kind tk, const std::string &tgt_name) {
     out.push_back(s);
   };
   if (tgt_name == "sdiv" || tgt_name == "udiv" ||
-      tgt_name == "srem" || tgt_name == "urem")
+      tgt_name == "srem" || tgt_name == "urem" ||
+      tgt_name == "llvm.sdiv.fix" || tgt_name == "llvm.udiv.fix" ||
+      tgt_name == "llvm.sdiv.fix.sat" || tgt_name == "llvm.udiv.fix.sat")
     push(1);
   if (tk == K_SELECT) {
     push(1);
@@ -533,6 +620,9 @@ std::vector<int> controlSlotPriority(Kind tk, const std::string &tgt_name) {
 
 // Cast type pairs. Mirrors litmus-gen's hard-coded list so the two tools
 // emit comparable IR shapes. Returned as (src, dst).
+//
+// For cmp/fp/sat kinds the pair is interpreted as (operand type,
+// result type). scmp/ucmp pin the result at i8 per the brief.
 const std::vector<std::pair<std::string, std::string>> &
 castPairs(const std::string &inst_name) {
   static const std::vector<std::pair<std::string, std::string>> kTrunc = {
@@ -541,9 +631,34 @@ castPairs(const std::string &inst_name) {
   static const std::vector<std::pair<std::string, std::string>> kExtend = {
       {"i16", "i32"}, {"i8", "i32"}, {"i32", "i64"}, {"i8", "i16"},
   };
+  static const std::vector<std::pair<std::string, std::string>> kFpToInt = {
+      {"float", "i32"}, {"double", "i64"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kIntToFp = {
+      {"i32", "float"}, {"i64", "double"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kFpExt = {
+      {"float", "double"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kFpTrunc = {
+      {"double", "float"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kFpToISat = {
+      {"float", "i32"}, {"double", "i64"}, {"float", "i64"}, {"double", "i32"},
+  };
+  static const std::vector<std::pair<std::string, std::string>> kCmpIntr = {
+      {"i32", "i8"}, {"i64", "i8"},
+  };
   static const std::vector<std::pair<std::string, std::string>> kEmpty;
   if (inst_name == "trunc") return kTrunc;
   if (inst_name == "zext" || inst_name == "sext") return kExtend;
+  if (inst_name == "fptoui" || inst_name == "fptosi") return kFpToInt;
+  if (inst_name == "uitofp" || inst_name == "sitofp") return kIntToFp;
+  if (inst_name == "fpext") return kFpExt;
+  if (inst_name == "fptrunc") return kFpTrunc;
+  if (inst_name == "llvm.fptoui.sat" || inst_name == "llvm.fptosi.sat")
+    return kFpToISat;
+  if (inst_name == "llvm.scmp" || inst_name == "llvm.ucmp") return kCmpIntr;
   return kEmpty;
 }
 
@@ -677,6 +792,26 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
              slot_vars[0] + ", " + T + " " + slot_vars[1] + ")\n  " +
              result_var + " = extractvalue {" + T + ", i1} " + res_var + ", 0";
     }
+    case K_FIXED_POINT_INTRINSIC: {
+      // Two iN value operands plus a constant i32 scale=0 immarg.
+      if (!isInt(T)) return {};
+      const std::string call = std::string("@") + inst_name + "." + T;
+      decls.insert("declare " + T + " " + call + "(" + T + ", " + T +
+                   ", i32 immarg)");
+      return result_var + " = call " + T + " " + call + "(" + T + " " +
+             slot_vars[0] + ", " + T + " " + slot_vars[1] + ", i32 0)";
+    }
+    case K_CMP_INTRINSIC: {
+      // Two-suffix mangling: result type then operand type.
+      // Example: @llvm.scmp.i8.i32(i32 %x, i32 %y) -> i8.
+      if (!isInt(in_type) || !isInt(out_type)) return {};
+      const std::string call =
+          std::string("@") + inst_name + "." + out_type + "." + in_type;
+      decls.insert("declare " + out_type + " " + call + "(" + in_type + ", " +
+                   in_type + ")");
+      return result_var + " = call " + out_type + " " + call + "(" + in_type +
+             " " + slot_vars[0] + ", " + in_type + " " + slot_vars[1] + ")";
+    }
     case K_FREEZE:
       return result_var + " = freeze " + T + " " + slot_vars[0];
     case K_SELECT:
@@ -751,6 +886,62 @@ std::string emitInstruction(Kind k, const std::string &inst_name,
       if (pred.empty()) return {};
       return result_var + " = fcmp " + fmfPrefix(rule) + pred + " " + T + " " +
              slot_vars[0] + ", " + slot_vars[1];
+    }
+    case K_FP_INT_CAST: {
+      // fptoui / fptosi / uitofp / sitofp. Cross-type cast. Only uitofp
+      // accepts the nneg flag (added in LLVM 17). The other directions
+      // have no recognized flag in our rules; reject any unexpected flag
+      // so we don't silently emit invalid IR.
+      std::string flag_str;
+      if (rule.flag.has_value()) {
+        const std::string &f = *rule.flag;
+        if (f == "nneg") {
+          if (inst_name != "uitofp") return {};
+          flag_str = "nneg ";
+        } else {
+          return {};
+        }
+      }
+      if (in_type == out_type) return {};
+      return result_var + " = " + inst_name + " " + flag_str + in_type + " " +
+             slot_vars[0] + " to " + out_type;
+    }
+    case K_FP_CAST: {
+      // fpext / fptrunc. The cast pair list already enforces the direction.
+      if (in_type == out_type) return {};
+      return result_var + " = " + inst_name + " " + in_type + " " +
+             slot_vars[0] + " to " + out_type;
+    }
+    case K_POWI_INTRINSIC: {
+      // (FP Val, i32 power) -> FP. Mangling: @llvm.powi.<fpsuffix>.i32.
+      const std::string suffix = intrinsicSuffix(T);
+      if (suffix.empty()) return {};
+      const std::string call =
+          std::string("@") + inst_name + "." + suffix + ".i32";
+      decls.insert("declare " + T + " " + call + "(" + T + ", i32)");
+      return result_var + " = call " + T + " " + call + "(" + T + " " +
+             slot_vars[0] + ", i32 " + slot_vars[1] + ")";
+    }
+    case K_FPCLASS_INTRINSIC: {
+      // (FP, i32 immarg test) -> i1. Use mask 783 (fcNormal | fcSubnormal |
+      // fcZero) as the default test.
+      const std::string suffix = intrinsicSuffix(T);
+      if (suffix.empty()) return {};
+      const std::string call = std::string("@") + inst_name + "." + suffix;
+      decls.insert("declare i1 " + call + "(" + T + ", i32 immarg)");
+      return result_var + " = call i1 " + call + "(" + T + " " + slot_vars[0] +
+             ", i32 783)";
+    }
+    case K_FPTOI_SAT: {
+      // Two-suffix mangling: result int type then source FP type.
+      // Example: @llvm.fptoui.sat.i32.f32(float %x) -> i32.
+      const std::string src_suffix = intrinsicSuffix(in_type);
+      if (src_suffix.empty() || !isInt(out_type)) return {};
+      const std::string call = std::string("@") + inst_name + "." + out_type +
+                               "." + src_suffix;
+      decls.insert("declare " + out_type + " " + call + "(" + in_type + ")");
+      return result_var + " = call " + out_type + " " + call + "(" + in_type +
+             " " + slot_vars[0] + ")";
     }
     default:
       return {};
@@ -1094,8 +1285,8 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
                   const std::string &tgt_name, int target_slot,
                   const std::set<std::string> &requested_types) {
   std::vector<std::pair<SideType, SideType>> out;
-  const bool a_cast = (sk == K_CAST);
-  const bool b_cast = (tk == K_CAST);
+  const bool a_cast = isCastKind(sk);
+  const bool b_cast = isCastKind(tk);
 
   auto tgtSlotType = [&](const std::string &b_in, const std::string &b_out) {
     return slotType(tk, target_slot, b_in, b_out);
@@ -1103,6 +1294,34 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
   auto srcResultType = [&](const std::string &a_in, const std::string &a_out) {
     return resultType(sk, a_in, a_out);
   };
+
+  // Special-case: K_POWI's power slot is i32 regardless of B's primary FP
+  // type. The standard enumeration (which forces B.in == A.out) breaks
+  // because powi needs an FP primary type, so we can't set B.in = i32.
+  // Enumerate B at its FP types and A at whatever produces i32.
+  if (tk == K_POWI_INTRINSIC && target_slot == 1) {
+    static const char *kFp[] = {"float", "double"};
+    for (const char *Tb_c : kFp) {
+      std::string Tb = Tb_c;
+      if (!requested_types.count(Tb)) continue;
+      if (!supportsType(tk, tgt_name, Tb)) continue;
+      SideType B{Tb, Tb};
+      if (a_cast) {
+        for (const auto &pa : castPairs(src_name)) {
+          SideType A{pa.first, pa.second};
+          if (srcResultType(A.in, A.out) != "i32") continue;
+          out.push_back({A, B});
+        }
+      } else {
+        if (!requested_types.count("i32")) continue;
+        if (!supportsType(sk, src_name, "i32")) continue;
+        SideType A{"i32", "i32"};
+        if (srcResultType(A.in, A.out) != "i32") continue;
+        out.push_back({A, B});
+      }
+    }
+    return out;
+  }
 
   if (!a_cast && !b_cast) {
     for (const auto &T : requested_types) {
@@ -1125,6 +1344,7 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
       // For K_SELECT slot 0 == i1, but A.out from our cast pair list is
       // never i1, so that combo is skipped by the connection check.
       const std::string T = A.out;
+      if (!supportsType(tk, tgt_name, T)) continue;
       SideType B{T, T};
       if (srcResultType(A.in, A.out) != tgtSlotType(B.in, B.out)) continue;
       out.push_back({A, B});
@@ -1136,6 +1356,7 @@ typeCombosForEdge(Kind sk, const std::string &src_name, Kind tk,
       SideType B{p.first, p.second};
       // A is non-cast → A.in == A.out == T. A.out must equal B's input.
       const std::string T = B.in;
+      if (!supportsType(sk, src_name, T)) continue;
       SideType A{T, T};
       // For K_ICMP source, srcResultType is i1 (not T). The cast pair
       // list doesn't include i1 source, so the connection always fails.
