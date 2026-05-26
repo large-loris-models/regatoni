@@ -17,7 +17,7 @@ TRIAGE_DIR="$RUN_DIR/triage"
 TRIAGE_COUNT_FILE="$TRIAGE_DIR/.miscomp_count"
 TRIAGE_LOG="$TRIAGE_DIR/triage.log"
 TRIAGE_SCRIPT="$SCRIPT_DIR/../analysis/triage_miscompilations.sh"
-TRIAGE_EVERY="${TRIAGE_EVERY:-20}"
+TRIAGE_EVERY="${TRIAGE_EVERY:-5}"
 
 if [[ ! -x "$HARNESS" ]]; then
     oracle_log "ERROR: harness not found or not executable: $HARNESS"

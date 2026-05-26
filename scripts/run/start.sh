@@ -7,8 +7,15 @@
 # results, miscompilations, triage, stats) lives under that directory.
 #
 # Usage:
-#   nohup ./scripts/run/start.sh [--seeds DIR] > /dev/null 2>&1 &
+#   nohup ./scripts/run/start.sh [--seeds DIR[,DIR...]] [--seeds DIR ...] \
+#         [--clean] [--dry-run] > /dev/null 2>&1 &
 #   ./scripts/run/stop.sh
+#
+# --seeds    seed directory(ies); repeatable and/or comma-separated.
+#            Default: $SPLIT_SEEDS_DIR.
+# --clean    isolate dedup.db at $RUN_DIR/dedup.db and flush Redis.
+# --dry-run  set up the run dir and copy seeds, then exit before launching
+#            Centipede or any oracles. Useful for verifying flags/seeds.
 
 set -u
 
@@ -18,32 +25,52 @@ source "$SCRIPT_DIR/run_helpers.sh"
 
 # ── Arg parsing ─────────────────────────────────────────────────────────────
 
-SEEDS_ARG=""
+SEED_SOURCES=()
+CLEAN_RUN=0
+DRY_RUN=0
+_append_seed_arg() {
+    local raw="$1"
+    local part
+    IFS=',' read -r -a _parts <<< "$raw"
+    for part in "${_parts[@]}"; do
+        [[ -n "$part" ]] && SEED_SOURCES+=("$part")
+    done
+}
 while (( $# > 0 )); do
     case "$1" in
-        --seeds)    SEEDS_ARG="${2:-}"; shift 2 ;;
-        --seeds=*)  SEEDS_ARG="${1#--seeds=}"; shift ;;
+        --seeds)    _append_seed_arg "${2:-}"; shift 2 ;;
+        --seeds=*)  _append_seed_arg "${1#--seeds=}"; shift ;;
+        --clean)    CLEAN_RUN=1; shift ;;
+        --dry-run)  DRY_RUN=1; shift ;;
         -h|--help)
-            sed -n '2,11p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
-SEED_SOURCE="${SEEDS_ARG:-$SPLIT_SEEDS_DIR}"
-if [[ ! -d "$SEED_SOURCE" ]]; then
-    echo "ERROR: --seeds path does not exist: $SEED_SOURCE" >&2
-    exit 1
+if (( ${#SEED_SOURCES[@]} == 0 )); then
+    SEED_SOURCES=("$SPLIT_SEEDS_DIR")
 fi
-if [[ -z "$(find "$SEED_SOURCE" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]]; then
-    echo "ERROR: --seeds path is empty: $SEED_SOURCE" >&2
-    exit 1
-fi
+
+for src in "${SEED_SOURCES[@]}"; do
+    if [[ ! -d "$src" ]]; then
+        echo "ERROR: --seeds path does not exist: $src" >&2
+        exit 1
+    fi
+    if [[ -z "$(find "$src" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]]; then
+        echo "ERROR: --seeds path is empty: $src" >&2
+        exit 1
+    fi
+done
+
+# Comma-joined for manifest.json.
+SEED_SOURCE_DESC="$(IFS=,; echo "${SEED_SOURCES[*]}")"
 
 # ── Initialize run directory ────────────────────────────────────────────────
 
-regatoni_init_run_dir "$SEED_SOURCE"
+regatoni_init_run_dir "$SEED_SOURCE_DESC"
 RUN_DIR="$(regatoni_run_dir)"
 export RUN_DIR RUN_ID
 
@@ -57,6 +84,35 @@ START_TIME="$(date +%s)"
 log() { echo "[$(date -Is)] [start] $*" | tee -a "$RUN_LOG" >&2; }
 
 log "RUN_ID=$RUN_ID  RUN_DIR=$RUN_DIR"
+
+# ── --clean: isolate dedup.db, flush Redis ──────────────────────────────────
+# Downstream Python/bash scripts honor REGATONI_DEDUP_DB and fall back to the
+# project-root dedup.db when it is unset.
+
+if (( CLEAN_RUN )); then
+    DEDUP_DB_PATH="$RUN_DIR/dedup.db"
+    export REGATONI_DEDUP_DB="$DEDUP_DB_PATH"
+
+    redis_flushed="no"
+    if command -v redis-cli >/dev/null 2>&1; then
+        if redis-cli -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" \
+                FLUSHDB >/dev/null 2>&1; then
+            redis_flushed="yes"
+        else
+            log "WARNING: redis-cli FLUSHDB failed (Redis unreachable?); continuing"
+        fi
+    else
+        log "redis-cli not found; skipping FLUSHDB"
+    fi
+
+    if [[ "$redis_flushed" == "yes" ]]; then
+        log "Clean run: isolated dedup.db at $DEDUP_DB_PATH, Redis flushed"
+    else
+        log "Clean run: isolated dedup.db at $DEDUP_DB_PATH (Redis not flushed)"
+    fi
+else
+    DEDUP_DB_PATH="${REGATONI_DEDUP_DB:-$PROJECT_ROOT/dedup.db}"
+fi
 
 # ── Detect available cores ──────────────────────────────────────────────────
 
@@ -201,13 +257,41 @@ export CORPUS_DIR
 export REGATONI_WORKDIR="$FUZZ_WORKDIR"
 
 # Harness reads this to build the cross-corpus inline_call splicing index.
-# Defaults to split_seeds/ if unset; we point it at whatever --seeds resolved to.
-export REGATONI_CORPUS_INDEX_DIR="$SEED_SOURCE"
+# We point it at $CORPUS_DIR (populated below from every --seeds dir) so the
+# index sees the full union regardless of how many seed sources were given.
+export REGATONI_CORPUS_INDEX_DIR="$CORPUS_DIR"
 
-# Copy seeds from --seeds path into the per-run corpus dir.
-log "Copying seeds from $SEED_SOURCE into $CORPUS_DIR..."
-find "$SEED_SOURCE" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"
-log "Copied $(find "$CORPUS_DIR" -maxdepth 1 -type f | wc -l) seed files"
+# Copy seeds from each --seeds source into the per-run corpus dir. cp will
+# overwrite on filename collisions across sources (last source wins).
+log "Copying seeds into $CORPUS_DIR..."
+for src in "${SEED_SOURCES[@]}"; do
+    n_before=$(find "$CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    find "$src" -maxdepth 1 -type f -print0 | xargs -0 cp -t "$CORPUS_DIR/"
+    n_after=$(find "$CORPUS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    log "  $((n_after - n_before)) seeds from $src"
+done
+TOTAL_SEEDS=$(find "$CORPUS_DIR" -maxdepth 1 -type f | wc -l)
+log "Total seeds in corpus: $TOTAL_SEEDS"
+
+# ── Run summary ─────────────────────────────────────────────────────────────
+
+CLEAN_RUN_DESC="no"
+(( CLEAN_RUN )) && CLEAN_RUN_DESC="yes"
+
+log "═══════════════════════════════════════"
+log "Regatoni run: $RUN_ID"
+log "Seeds: $TOTAL_SEEDS files from $SEED_SOURCE_DESC"
+log "Corpus: $CORPUS_DIR/"
+log "Dedup DB: $DEDUP_DB_PATH"
+log "Miscompilations: $RUN_DIR/miscompilations/"
+log "Clean run: $CLEAN_RUN_DESC"
+log "═══════════════════════════════════════"
+
+if (( DRY_RUN )); then
+    log "Dry run: exiting before launching Centipede or oracles."
+    regatoni_finalize_run_dir "$RUN_ID"
+    exit 0
+fi
 
 # ── Centipede flags ─────────────────────────────────────────────────────────
 

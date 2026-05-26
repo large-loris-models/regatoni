@@ -57,9 +57,13 @@ static llvm::TargetMachine *g_default_tm = nullptr;
 // kUserDomains[mutation_id - 1] — one domain per mutator. The lower 32 bits
 // carry a per-input hash so distinct inputs from the same mutator count as
 // distinct user features in that mutator's domain.
-static constexpr size_t kNumExtraFeatures = 64;
-__attribute__((used, retain, section("__centipede_extra_features")))
-static uint64_t regatoni_extra_features[kNumExtraFeatures];
+//
+// DISABLED: usr* channels were noise without useful signal for the current
+// campaign. Re-enable by uncommenting the array below and the write site in
+// LLVMFuzzerTestOneInput.
+// static constexpr size_t kNumExtraFeatures = 64;
+// __attribute__((used, retain, section("__centipede_extra_features")))
+// static uint64_t regatoni_extra_features[kNumExtraFeatures];
 
 static thread_local uint32_t g_last_mutation_id = 0;
 
@@ -346,12 +350,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   // Per-mutator user-feature: high 32 bits = domain id (mid - 1), low 32 bits
   // = per-input hash so distinct inputs from the same mutator are distinct
   // user features inside that mutator's domain.
+  // DISABLED — see the regatoni_extra_features declaration above.
   if (mid != 0) {
-    uint32_t slot = mid - 1;
-    if (slot < kNumExtraFeatures) {
-      regatoni_extra_features[slot] =
-          (uint64_t{slot} << 32) | uint64_t{fnv1a32(Data, Size)};
-    }
+    // uint32_t slot = mid - 1;
+    // if (slot < kNumExtraFeatures) {
+    //   regatoni_extra_features[slot] =
+    //       (uint64_t{slot} << 32) | uint64_t{fnv1a32(Data, Size)};
+    // }
     bumpStat(mid, kSuccess);
   }
   return 0;
