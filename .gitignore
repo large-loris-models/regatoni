@@ -19,6 +19,7 @@ seeds/
 split_seeds/
 miscompilations/
 runs/
+/output/
 
 # Python
 __pycache__/
