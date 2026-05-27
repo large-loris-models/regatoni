@@ -15,6 +15,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
@@ -673,6 +674,403 @@ json aggregateToJson(const Aggregate &agg) {
   return j;
 }
 
+// ======================================================================
+// Enrichment analysis. Optional second pass over each function that
+// answers:
+//   1) How many instructions have opcodes our rule database covers?
+//   2) Of those, how many already carry flags vs. could be enriched?
+//   3) Natural composition chains: producer/consumer pairs where both
+//      ends are rule-bearing opcodes (and whether the pair matches an
+//      edge in the compatibility matrix).
+//   4) Structural context for those chains (in-loop, cross-BB, phi).
+// ======================================================================
+
+// Rule-bearing LLVM opcode names (Instruction::getOpcodeName() strings).
+static const std::unordered_set<std::string> &ruleOpcodes() {
+  static const std::unordered_set<std::string> S = {
+    "add","sub","mul","sdiv","udiv","srem","urem",
+    "shl","lshr","ashr","and","or","xor",
+    "fadd","fsub","fmul","fdiv","frem","fneg",
+    "trunc","zext","sext",
+    "getelementptr","icmp","fcmp","select","freeze",
+    "fptoui","fptosi","uitofp","sitofp","fpext","fptrunc",
+  };
+  return S;
+}
+
+// Map an LLVM opcode name to the prefix used in compat_matrix rule
+// names (e.g. LLVM "getelementptr" -> matrix "gep"). Returns empty
+// string for opcodes the matrix does not currently model — those
+// pairs still get counted as natural chains, just not as matrix edges.
+static std::string opcodeToMatrixPrefix(const std::string &op) {
+  if (op == "getelementptr") return "gep";
+  static const std::unordered_set<std::string> SAME = {
+    "fadd","fsub","fmul","fdiv","frem","fneg",
+    "trunc","zext","sext","fpext","fptrunc",
+    "fptosi","fptoui","sitofp","uitofp",
+    "icmp","fcmp","select","freeze",
+  };
+  if (SAME.count(op)) return op;
+  return std::string();
+}
+
+// (producer_matrix_prefix, consumer_matrix_prefix) edges from
+// docs/compat_matrix.json.
+using MatrixEdges = std::unordered_set<std::string>;
+static std::string edgeKey(const std::string &a, const std::string &b) {
+  return a + "->" + b;
+}
+static MatrixEdges loadMatrixEdges(const std::string &path) {
+  MatrixEdges edges;
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr,
+        "[enrichment] cannot open %s — chain matrix-edge match disabled\n",
+        path.c_str());
+    return edges;
+  }
+  json j;
+  try { in >> j; }
+  catch (const std::exception &e) {
+    std::fprintf(stderr, "[enrichment] failed to parse %s: %s\n",
+                 path.c_str(), e.what());
+    return edges;
+  }
+  if (!j.contains("edges") || !j["edges"].is_array()) return edges;
+  for (const auto &e : j["edges"]) {
+    if (!e.contains("source_rule") || !e.contains("target_rule")) continue;
+    std::string s = e["source_rule"].get<std::string>();
+    std::string t = e["target_rule"].get<std::string>();
+    auto dot_s = s.find('.'); if (dot_s == std::string::npos) continue;
+    auto dot_t = t.find('.'); if (dot_t == std::string::npos) continue;
+    edges.insert(edgeKey(s.substr(0, dot_s), t.substr(0, dot_t)));
+  }
+  return edges;
+}
+
+// Per-instruction flag check. Returns true iff the instruction carries
+// at least one of nsw / nuw / exact / inbounds / nneg / disjoint /
+// any FMF bit.
+static bool hasAnyFlag(const llvm::Instruction &I) {
+  using namespace llvm;
+  if (const auto *OBO = dyn_cast<OverflowingBinaryOperator>(&I))
+    if (OBO->hasNoSignedWrap() || OBO->hasNoUnsignedWrap()) return true;
+  if (const auto *PEO = dyn_cast<PossiblyExactOperator>(&I))
+    if (PEO->isExact()) return true;
+  if (const auto *GEPO = dyn_cast<GEPOperator>(&I))
+    if (GEPO->isInBounds()) return true;
+  if (const auto *PDI = dyn_cast<PossiblyDisjointInst>(&I))
+    if (PDI->isDisjoint()) return true;
+  if (I.getOpcode() == Instruction::ZExt && I.hasNonNeg()) return true;
+  if (isa<FPMathOperator>(&I)) {
+    FastMathFlags FMF = I.getFastMathFlags();
+    if (FMF.any()) return true;
+  }
+  return false;
+}
+
+// Iterative Tarjan SCC over a function's CFG. Marks `in_loop_bbs` for
+// every BB whose SCC has size > 1 or which has a self-edge.
+static void computeInLoopBBs(
+    const llvm::Function &F,
+    std::unordered_set<const llvm::BasicBlock *> &in_loop_bbs) {
+  using BBPtr = const llvm::BasicBlock *;
+  if (F.empty()) return;
+
+  std::unordered_map<BBPtr, int> index, lowlink;
+  std::unordered_set<BBPtr> on_stack;
+  std::vector<BBPtr> stack;
+  std::vector<std::vector<BBPtr>> sccs;
+  int next_idx = 0;
+
+  struct Frame {
+    BBPtr bb;
+    unsigned next_succ;
+  };
+  std::vector<Frame> dfs;
+
+  for (const auto &BB : F) {
+    BBPtr root = &BB;
+    if (index.count(root)) continue;
+    dfs.push_back({root, 0});
+    index[root] = lowlink[root] = next_idx++;
+    stack.push_back(root); on_stack.insert(root);
+
+    while (!dfs.empty()) {
+      Frame &top = dfs.back();
+      const auto *term = top.bb->getTerminator();
+      unsigned ns = term ? term->getNumSuccessors() : 0;
+      if (top.next_succ < ns) {
+        BBPtr w = term->getSuccessor(top.next_succ++);
+        if (!index.count(w)) {
+          index[w] = lowlink[w] = next_idx++;
+          stack.push_back(w); on_stack.insert(w);
+          dfs.push_back({w, 0});
+        } else if (on_stack.count(w)) {
+          lowlink[top.bb] = std::min(lowlink[top.bb], index[w]);
+        }
+      } else {
+        if (lowlink[top.bb] == index[top.bb]) {
+          std::vector<BBPtr> scc;
+          while (true) {
+            BBPtr w = stack.back(); stack.pop_back(); on_stack.erase(w);
+            scc.push_back(w);
+            if (w == top.bb) break;
+          }
+          sccs.push_back(std::move(scc));
+        }
+        BBPtr finished = top.bb;
+        dfs.pop_back();
+        if (!dfs.empty())
+          lowlink[dfs.back().bb] =
+              std::min(lowlink[dfs.back().bb], lowlink[finished]);
+      }
+    }
+  }
+
+  for (const auto &scc : sccs) {
+    if (scc.size() > 1) {
+      for (BBPtr b : scc) in_loop_bbs.insert(b);
+    } else {
+      // Self-loop check.
+      BBPtr b = scc.front();
+      const auto *term = b->getTerminator();
+      unsigned ns = term ? term->getNumSuccessors() : 0;
+      for (unsigned k = 0; k < ns; ++k) {
+        if (term->getSuccessor(k) == b) { in_loop_bbs.insert(b); break; }
+      }
+    }
+  }
+}
+
+// Aggregate accumulator (merged across worker threads at end).
+struct EnrichmentAgg {
+  // Q1
+  size_t total_matchable = 0;
+  size_t fns_with_any_matchable = 0;
+  std::map<std::string, unsigned long> matchable_per_opcode;
+  std::map<std::string, unsigned long> matchable_dist; // bucketed
+
+  // Q2
+  size_t matchable_with_no_flags = 0;
+  size_t matchable_with_flags = 0;
+  // matchable_per_opcode + matchable_with_flags by opcode
+  std::map<std::string, unsigned long> matchable_with_flags_by_opcode;
+  std::map<std::string, unsigned long> matchable_no_flags_by_opcode;
+
+  // Q3
+  size_t total_chains = 0;
+  size_t total_chains_matrix_match = 0;
+  // (prod_op, cons_op) -> count
+  std::map<std::pair<std::string, std::string>, unsigned long> chain_pairs;
+  // same but only counts pairs that match a matrix edge
+  std::map<std::pair<std::string, std::string>, unsigned long>
+      chain_pairs_matrix_matched;
+
+  // Q4
+  size_t chains_in_loop = 0;
+  size_t chains_cross_bb = 0;
+  size_t chains_phi_context = 0;
+};
+
+static const char *bucketMatchable(unsigned n) {
+  if (n == 0)   return "0";
+  if (n <= 2)   return "1-2";
+  if (n <= 5)   return "3-5";
+  if (n <= 10)  return "6-10";
+  if (n <= 20)  return "11-20";
+  if (n <= 50)  return "21-50";
+  return "51+";
+}
+
+static void analyzeEnrichment(const llvm::Function &F,
+                              const MatrixEdges &edges,
+                              EnrichmentAgg &agg) {
+  using namespace llvm;
+  if (F.isDeclaration() || F.empty()) {
+    agg.matchable_dist[bucketMatchable(0)] += 1;
+    return;
+  }
+
+  // Structural context: in-loop BBs (SCC) and phi-containing BBs.
+  std::unordered_set<const BasicBlock *> in_loop_bbs;
+  computeInLoopBBs(F, in_loop_bbs);
+  std::unordered_set<const BasicBlock *> phi_bbs;
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      if (isa<PHINode>(I)) { phi_bbs.insert(&BB); break; }
+    }
+  }
+
+  const auto &rules = ruleOpcodes();
+  unsigned matchable_in_fn = 0;
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      std::string op = I.getOpcodeName() ? I.getOpcodeName() : "";
+      if (!rules.count(op)) continue;
+      ++matchable_in_fn;
+      ++agg.total_matchable;
+      ++agg.matchable_per_opcode[op];
+
+      bool flagged = hasAnyFlag(I);
+      if (flagged) {
+        ++agg.matchable_with_flags;
+        ++agg.matchable_with_flags_by_opcode[op];
+      } else {
+        ++agg.matchable_with_no_flags;
+        ++agg.matchable_no_flags_by_opcode[op];
+      }
+
+      // Chains: for each user of I that is also a rule-bearing
+      // instruction in the same function, record a pair.
+      std::string prod_prefix = opcodeToMatrixPrefix(op);
+      for (const User *U : I.users()) {
+        const auto *UI = dyn_cast<Instruction>(U);
+        if (!UI) continue;
+        if (UI->getFunction() != &F) continue;
+        std::string uop = UI->getOpcodeName() ? UI->getOpcodeName() : "";
+        if (!rules.count(uop)) continue;
+
+        ++agg.total_chains;
+        auto key = std::make_pair(op, uop);
+        ++agg.chain_pairs[key];
+
+        if (!prod_prefix.empty()) {
+          std::string cons_prefix = opcodeToMatrixPrefix(uop);
+          if (!cons_prefix.empty() &&
+              edges.count(edgeKey(prod_prefix, cons_prefix))) {
+            ++agg.total_chains_matrix_match;
+            ++agg.chain_pairs_matrix_matched[key];
+          }
+        }
+
+        // Structural context.
+        const BasicBlock *PB = I.getParent();
+        const BasicBlock *CB = UI->getParent();
+        if (in_loop_bbs.count(PB) || in_loop_bbs.count(CB))
+          ++agg.chains_in_loop;
+        if (PB != CB) ++agg.chains_cross_bb;
+        if (phi_bbs.count(PB) || phi_bbs.count(CB))
+          ++agg.chains_phi_context;
+      }
+    }
+  }
+
+  if (matchable_in_fn > 0) ++agg.fns_with_any_matchable;
+  agg.matchable_dist[bucketMatchable(matchable_in_fn)] += 1;
+}
+
+static void mergeEnrichment(EnrichmentAgg &dst, const EnrichmentAgg &src) {
+  dst.total_matchable          += src.total_matchable;
+  dst.fns_with_any_matchable   += src.fns_with_any_matchable;
+  dst.matchable_with_no_flags  += src.matchable_with_no_flags;
+  dst.matchable_with_flags     += src.matchable_with_flags;
+  dst.total_chains             += src.total_chains;
+  dst.total_chains_matrix_match += src.total_chains_matrix_match;
+  dst.chains_in_loop           += src.chains_in_loop;
+  dst.chains_cross_bb          += src.chains_cross_bb;
+  dst.chains_phi_context       += src.chains_phi_context;
+  for (auto &kv : src.matchable_per_opcode)
+    dst.matchable_per_opcode[kv.first] += kv.second;
+  for (auto &kv : src.matchable_dist)
+    dst.matchable_dist[kv.first] += kv.second;
+  for (auto &kv : src.matchable_with_flags_by_opcode)
+    dst.matchable_with_flags_by_opcode[kv.first] += kv.second;
+  for (auto &kv : src.matchable_no_flags_by_opcode)
+    dst.matchable_no_flags_by_opcode[kv.first] += kv.second;
+  for (auto &kv : src.chain_pairs)
+    dst.chain_pairs[kv.first] += kv.second;
+  for (auto &kv : src.chain_pairs_matrix_matched)
+    dst.chain_pairs_matrix_matched[kv.first] += kv.second;
+}
+
+static json enrichmentToJson(const EnrichmentAgg &e, size_t num_functions,
+                             size_t num_files, const std::string &corpus) {
+  json j;
+  j["corpus_path"]   = corpus;
+  j["num_files"]     = num_files;
+  j["num_functions"] = num_functions;
+
+  // Q1
+  j["q1_matchable"] = {
+    {"total_matchable",          e.total_matchable},
+    {"fns_with_any_matchable",   e.fns_with_any_matchable},
+    {"fns_with_any_matchable_pct",
+        num_functions == 0
+            ? 0.0
+            : 100.0 * double(e.fns_with_any_matchable) / double(num_functions)},
+    {"avg_matchable_per_function",
+        num_functions == 0
+            ? 0.0
+            : double(e.total_matchable) / double(num_functions)},
+    {"per_opcode",               e.matchable_per_opcode},
+    {"distribution",             e.matchable_dist},
+  };
+
+  // Q2
+  size_t denom_q2 = e.total_matchable;
+  j["q2_flag_potential"] = {
+    {"matchable_total",          e.total_matchable},
+    {"matchable_no_flags",       e.matchable_with_no_flags},
+    {"matchable_with_flags",     e.matchable_with_flags},
+    {"matchable_no_flags_pct",
+        denom_q2 == 0
+            ? 0.0
+            : 100.0 * double(e.matchable_with_no_flags) / double(denom_q2)},
+    {"matchable_with_flags_pct",
+        denom_q2 == 0
+            ? 0.0
+            : 100.0 * double(e.matchable_with_flags) / double(denom_q2)},
+    {"no_flags_by_opcode",       e.matchable_no_flags_by_opcode},
+    {"with_flags_by_opcode",     e.matchable_with_flags_by_opcode},
+  };
+
+  // Q3
+  json pairs = json::array();
+  for (auto &kv : e.chain_pairs) {
+    pairs.push_back({
+      {"producer", kv.first.first},
+      {"consumer", kv.first.second},
+      {"count",    kv.second},
+      {"in_matrix",
+          e.chain_pairs_matrix_matched.count(kv.first) > 0},
+      {"matrix_match_count",
+          e.chain_pairs_matrix_matched.count(kv.first) > 0
+              ? e.chain_pairs_matrix_matched.at(kv.first)
+              : 0ul},
+    });
+  }
+  j["q3_chains"] = {
+    {"total_chains",           e.total_chains},
+    {"chains_matrix_matched",  e.total_chains_matrix_match},
+    {"chains_matrix_matched_pct",
+        e.total_chains == 0
+            ? 0.0
+            : 100.0 * double(e.total_chains_matrix_match)
+                    / double(e.total_chains)},
+    {"pairs",                  pairs},
+  };
+
+  // Q4
+  size_t denom_q4 = e.total_chains;
+  j["q4_structural_context"] = {
+    {"chains_in_loop",       e.chains_in_loop},
+    {"chains_cross_bb",      e.chains_cross_bb},
+    {"chains_phi_context",   e.chains_phi_context},
+    {"in_loop_pct",
+        denom_q4 == 0 ? 0.0
+                      : 100.0 * double(e.chains_in_loop) / double(denom_q4)},
+    {"cross_bb_pct",
+        denom_q4 == 0 ? 0.0
+                      : 100.0 * double(e.chains_cross_bb) / double(denom_q4)},
+    {"phi_context_pct",
+        denom_q4 == 0 ? 0.0
+                      : 100.0 * double(e.chains_phi_context) / double(denom_q4)},
+  };
+
+  return j;
+}
+
 // ----------------------------------------------------------------------
 // File enumeration + worker pool.
 // ----------------------------------------------------------------------
@@ -708,6 +1106,7 @@ void readFileList(const std::string &path, std::vector<std::string> &out) {
 
 struct WorkerResult {
   Aggregate agg;
+  EnrichmentAgg enrich;
   std::vector<json> per_file;  // populated only if per_file enabled
   size_t files_done = 0;
   size_t files_failed = 0;
@@ -716,6 +1115,8 @@ struct WorkerResult {
 void worker(const std::vector<std::string> &paths,
             size_t begin, size_t end,
             bool per_file,
+            bool enrichment_enabled,
+            const MatrixEdges *matrix_edges,
             std::atomic<size_t> *progress,
             WorkerResult *out) {
   llvm::LLVMContext Ctx;
@@ -748,6 +1149,8 @@ void worker(const std::vector<std::string> &paths,
       if (F.isDeclaration()) continue;
       FnMetrics m = analyzeFunction(p, F);
       accumulate(out->agg, m);
+      if (enrichment_enabled && matrix_edges)
+        analyzeEnrichment(F, *matrix_edges, out->enrich);
       if (per_file) {
         per_file_fns.push_back(toJson(m));
         have_obj = true;
@@ -807,6 +1210,8 @@ struct Opts {
   std::string corpus_dir;
   std::string file_list;
   std::string output;
+  std::string enrichment_output;
+  std::string compat_matrix = "docs/compat_matrix.json";
   bool per_file = false;
   unsigned threads = 0;
   bool quiet = false;
@@ -816,6 +1221,8 @@ void usage() {
   std::fprintf(stderr,
     "Usage: corpus-analysis [--corpus-dir DIR | --file-list FILE]\n"
     "                       [--output PATH.json] [--per-file]\n"
+    "                       [--enrichment-output PATH.json]\n"
+    "                       [--compat-matrix PATH.json]\n"
     "                       [--threads N] [--quiet]\n");
 }
 
@@ -832,6 +1239,10 @@ bool parse(int argc, char **argv, Opts &o) {
     if (a == "--corpus-dir")      o.corpus_dir = next("--corpus-dir");
     else if (a == "--file-list")  o.file_list  = next("--file-list");
     else if (a == "--output")     o.output     = next("--output");
+    else if (a == "--enrichment-output")
+                                  o.enrichment_output = next("--enrichment-output");
+    else if (a == "--compat-matrix")
+                                  o.compat_matrix = next("--compat-matrix");
     else if (a == "--per-file")   o.per_file   = true;
     else if (a == "--threads")    o.threads    = std::stoi(next("--threads"));
     else if (a == "--quiet")      o.quiet      = true;
@@ -897,12 +1308,28 @@ int main(int argc, char **argv) {
     });
   }
 
+  // Load compat matrix once if enrichment requested.
+  MatrixEdges matrix_edges;
+  bool enrichment_enabled = !opts.enrichment_output.empty();
+  if (enrichment_enabled) {
+    if (!opts.quiet)
+      std::fprintf(stderr,
+        "[enrichment] loading compat matrix from %s\n",
+        opts.compat_matrix.c_str());
+    matrix_edges = loadMatrixEdges(opts.compat_matrix);
+    if (!opts.quiet)
+      std::fprintf(stderr,
+        "[enrichment] %zu (src,tgt) opcode-prefix edges\n",
+        matrix_edges.size());
+  }
+
   size_t chunk = (paths.size() + T - 1) / T;
   for (unsigned t = 0; t < T; ++t) {
     size_t b = std::min(paths.size(), size_t(t) * chunk);
     size_t e = std::min(paths.size(), b + chunk);
     threads.emplace_back(worker, std::cref(paths), b, e,
-                         opts.per_file, &progress, &results[t]);
+                         opts.per_file, enrichment_enabled,
+                         &matrix_edges, &progress, &results[t]);
   }
   for (auto &th : threads) th.join();
   done.store(true);
@@ -910,10 +1337,12 @@ int main(int argc, char **argv) {
 
   // Merge.
   Aggregate total;
+  EnrichmentAgg enrich_total;
   total.corpus_path = opts.corpus_dir.empty() ? opts.file_list : opts.corpus_dir;
   total.num_files = paths.size();
   for (auto &r : results) {
     merge(total, r.agg);
+    if (enrichment_enabled) mergeEnrichment(enrich_total, r.enrich);
     total.num_failed += r.files_failed;
   }
 
@@ -932,6 +1361,21 @@ int main(int argc, char **argv) {
     if (!opts.quiet)
       std::fprintf(stderr, "[corpus-analysis] wrote %s\n",
                    opts.output.c_str());
+  }
+
+  if (enrichment_enabled) {
+    json ej = enrichmentToJson(enrich_total, total.num_functions,
+                               total.num_files, total.corpus_path);
+    std::ofstream of(opts.enrichment_output);
+    if (!of) {
+      std::fprintf(stderr, "cannot write %s\n",
+                   opts.enrichment_output.c_str());
+      return 1;
+    }
+    of << ej.dump(2) << "\n";
+    if (!opts.quiet)
+      std::fprintf(stderr, "[corpus-analysis] wrote %s\n",
+                   opts.enrichment_output.c_str());
   }
 
   if (opts.per_file) {
