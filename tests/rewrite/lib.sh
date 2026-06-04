@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for rewrite-seeds test scripts. Sourced; not executed
+# Shared helpers for spec-mutate test scripts. Sourced; not executed
 # directly. Provides a self-contained run + assert API so each test
 # script reads top-down.
 
@@ -8,7 +8,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$REPO_ROOT/scripts/build/env.sh" >/dev/null
-BIN="$REPO_ROOT/build/rewrite-seeds"
+BIN="$REPO_ROOT/build/spec-mutate"
 OPT="$LLVM_BUILD_PLAIN/bin/opt"
 
 TMP="$(mktemp -d)"

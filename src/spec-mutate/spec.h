@@ -1,4 +1,4 @@
-// rewrite-seeds: in-memory representation of a JSON rewrite spec.
+// spec-mutate: in-memory representation of a JSON rewrite spec.
 //
 // A Spec is a list of Rewrites. Each Rewrite pairs a conjunctive match
 // against IR with one transform action. The engine doesn't know about
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 struct MatchSpec {
   std::string target;  // "instruction" | "parameter" | "function"
@@ -62,4 +62,4 @@ struct Spec {
 // Load the JSON spec at `path`. On failure returns false and sets `err`.
 bool loadSpec(const std::string &path, Spec &out, std::string &err);
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate

@@ -1,4 +1,4 @@
-// rewrite-seeds: transform actions.
+// spec-mutate: transform actions.
 //
 // applyTransform takes a cloned module, a VMap mapping original→clone,
 // the *original* function and the location (also referring to originals),
@@ -7,15 +7,15 @@
 
 #pragma once
 
-#include "src/rewrite-seeds/match_engine.h"
-#include "src/rewrite-seeds/spec.h"
+#include "src/spec-mutate/match_engine.h"
+#include "src/spec-mutate/spec.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 bool applyTransform(llvm::Module &CM,
                     llvm::ValueToValueMapTy &VMap,
@@ -23,4 +23,4 @@ bool applyTransform(llvm::Module &CM,
                     const MatchLocation &loc,
                     const TransformSpec &tx);
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate

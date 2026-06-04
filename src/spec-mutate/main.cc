@@ -1,4 +1,4 @@
-// rewrite-seeds — specification-driven IR rewriter.
+// spec-mutate — specification-driven IR rewriter.
 //
 // Reads a JSON spec (--spec rewrites.json) describing (match, transform)
 // pairs and applies each rewrite to every matching location in every .ll
@@ -9,9 +9,9 @@
 
 #include "deps/nlohmann-json/json.hpp"
 
-#include "src/rewrite-seeds/match_engine.h"
-#include "src/rewrite-seeds/spec.h"
-#include "src/rewrite-seeds/transform_engine.h"
+#include "src/spec-mutate/match_engine.h"
+#include "src/spec-mutate/spec.h"
+#include "src/spec-mutate/transform_engine.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
@@ -43,7 +43,7 @@
 
 namespace fs = std::filesystem;
 using nlohmann::json;
-using namespace rewrite_seeds;
+using namespace spec_mutate;
 
 namespace {
 
@@ -82,7 +82,7 @@ static void mergeStats(Stats &dst, const Stats &src) {
 }
 
 // ----------------------------------------------------------------------
-// File / name utilities (parallel to enrich-seeds).
+// File / name utilities.
 // ----------------------------------------------------------------------
 
 static std::string sanitize(std::string s) {
@@ -219,7 +219,7 @@ static void readFileList(const std::string &path,
                          std::vector<std::string> &out) {
   std::ifstream in(path);
   if (!in) {
-    std::fprintf(stderr, "rewrite-seeds: cannot open %s\n", path.c_str());
+    std::fprintf(stderr, "spec-mutate: cannot open %s\n", path.c_str());
     std::exit(1);
   }
   std::string line;
@@ -251,7 +251,7 @@ struct Opts {
 
 static void usage() {
   std::fprintf(stderr,
-    "Usage: rewrite-seeds --spec PATH --input-dir DIR --output-dir DIR\n"
+    "Usage: spec-mutate --spec PATH --input-dir DIR --output-dir DIR\n"
     "                    [--file-list FILE] [--categories CSV]\n"
     "                    [--summary-output PATH] [--threads N]\n"
     "                    [--seed N] [--max-files N] [--quiet]\n"
@@ -324,11 +324,11 @@ int main(int argc, char **argv) {
   Spec spec;
   std::string err;
   if (!loadSpec(opts.spec_path, spec, err)) {
-    std::fprintf(stderr, "rewrite-seeds: %s\n", err.c_str());
+    std::fprintf(stderr, "spec-mutate: %s\n", err.c_str());
     return 1;
   }
   if (!opts.quiet)
-    std::fprintf(stderr, "[rewrite-seeds] %zu rewrites loaded from %s\n",
+    std::fprintf(stderr, "[spec-mutate] %zu rewrites loaded from %s\n",
                  spec.rewrites.size(), opts.spec_path.c_str());
 
   bool include_all = false;
@@ -341,7 +341,7 @@ int main(int argc, char **argv) {
   if (opts.max_files && paths.size() > opts.max_files)
     paths.resize(opts.max_files);
   if (!opts.quiet)
-    std::fprintf(stderr, "[rewrite-seeds] %zu input files\n", paths.size());
+    std::fprintf(stderr, "[spec-mutate] %zu input files\n", paths.size());
 
   std::error_code ec;
   fs::create_directories(opts.output_dir, ec);
@@ -364,7 +364,7 @@ int main(int argc, char **argv) {
       while (!done.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
         size_t p = progress.load(std::memory_order_relaxed);
-        std::fprintf(stderr, "[rewrite-seeds] %zu / %zu files\n",
+        std::fprintf(stderr, "[spec-mutate] %zu / %zu files\n",
                      p, paths.size());
       }
     });
@@ -395,7 +395,7 @@ int main(int argc, char **argv) {
 
   if (!opts.quiet) {
     std::fprintf(stderr,
-      "[rewrite-seeds] %zu files / %zu functions / %zu variants written "
+      "[spec-mutate] %zu files / %zu functions / %zu variants written "
       "(verify_fail=%zu noop=%zu io_fail=%zu) in %.1fs\n",
       total.files_seen, total.fns_seen, total.variants_written,
       total.variants_verify_failed, total.variants_skipped_noop,

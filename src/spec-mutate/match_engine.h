@@ -1,4 +1,4 @@
-// rewrite-seeds: predicate evaluation.
+// spec-mutate: predicate evaluation.
 //
 // `findMatches(F, R)` walks F and returns every location at which R's
 // match predicates hold conjunctively. The transform engine then clones
@@ -6,14 +6,14 @@
 
 #pragma once
 
-#include "src/rewrite-seeds/spec.h"
+#include "src/spec-mutate/spec.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 
 #include <vector>
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 struct MatchLocation {
   enum Kind { kFunction, kInstruction, kParameter };
@@ -31,4 +31,4 @@ std::vector<MatchLocation> findMatches(const llvm::Function &F,
 // Exposed for unit-test reach: true iff `flag` is currently set on `I`.
 bool instHasFlag(const llvm::Instruction &I, const std::string &flag);
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate

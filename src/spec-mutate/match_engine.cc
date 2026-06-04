@@ -1,4 +1,4 @@
-#include "src/rewrite-seeds/match_engine.h"
+#include "src/spec-mutate/match_engine.h"
 
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -11,7 +11,7 @@
 
 #include <algorithm>
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 using namespace llvm;
 
@@ -210,4 +210,4 @@ std::vector<MatchLocation> findMatches(const Function &F, const Rewrite &R) {
   return out;
 }
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate

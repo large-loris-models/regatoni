@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build the rewrite-seeds CLI binary.
+# Build the spec-mutate CLI binary.
 #
-# Mirrors build_enrich_seeds.sh: plain LLVM, no sanitizers. The tool
+# Mirrors other build scripts in scripts/build/: plain LLVM, no sanitizers. The tool
 # parses a JSON rewrite spec, walks IR, clones modules, applies the
 # spec's transforms, and verifies each variant.
 
 source "$(dirname "$0")/env.sh"
 check_prereqs
 
-echo "=== Building rewrite-seeds ==="
+echo "=== Building spec-mutate ==="
 
 if [[ ! -f "$LLVM_BUILD_PLAIN/build.ninja" ]]; then
     echo "ERROR: LLVM plain build not found at $LLVM_BUILD_PLAIN" >&2
@@ -22,7 +22,7 @@ fi
 
 mkdir -p "$BUILD_OUT"
 
-echo "[rewrite-seeds] Extracting LLVM plain link libraries..."
+echo "[spec-mutate] Extracting LLVM plain link libraries..."
 mapfile -t LINK_LIBS < <(
     cd "$LLVM_BUILD_PLAIN" &&
     ninja -t commands bin/opt 2>/dev/null |
@@ -31,38 +31,38 @@ mapfile -t LINK_LIBS < <(
     sort -u |
     while read -r lib; do echo "$LLVM_BUILD_PLAIN/$lib"; done
 )
-echo "[rewrite-seeds] Found ${#LINK_LIBS[@]} plain LLVM libraries"
+echo "[spec-mutate] Found ${#LINK_LIBS[@]} plain LLVM libraries"
 
-RS_INCLUDES=(
+SM_INCLUDES=(
     -I"$PROJECT_ROOT"
     -I"$LLVM_BUILD_PLAIN/include"
     -I"$LLVM_SRC/llvm/include"
 )
 
-RS_SRCS=(
-    "$PROJECT_ROOT/src/rewrite-seeds/main.cc"
-    "$PROJECT_ROOT/src/rewrite-seeds/spec.cc"
-    "$PROJECT_ROOT/src/rewrite-seeds/match_engine.cc"
-    "$PROJECT_ROOT/src/rewrite-seeds/transform_engine.cc"
+SM_SRCS=(
+    "$PROJECT_ROOT/src/spec-mutate/main.cc"
+    "$PROJECT_ROOT/src/spec-mutate/spec.cc"
+    "$PROJECT_ROOT/src/spec-mutate/match_engine.cc"
+    "$PROJECT_ROOT/src/spec-mutate/transform_engine.cc"
 )
 
-RS_BIN="$BUILD_OUT/rewrite-seeds"
+SM_BIN="$BUILD_OUT/spec-mutate"
 
-RS_CFLAGS=(
+SM_CFLAGS=(
     "-g"
     "-O2"
     "-fno-omit-frame-pointer"
 )
 
-echo "[rewrite-seeds] Compiling + linking rewrite-seeds (plain LLVM)..."
-$CXX "${RS_CFLAGS[@]}" -std=c++17 -fno-rtti \
-    "${RS_INCLUDES[@]}" \
-    "${RS_SRCS[@]}" \
+echo "[spec-mutate] Compiling + linking spec-mutate (plain LLVM)..."
+$CXX "${SM_CFLAGS[@]}" -std=c++17 -fno-rtti \
+    "${SM_INCLUDES[@]}" \
+    "${SM_SRCS[@]}" \
     -fuse-ld=lld \
     -Wl,--start-group \
     "${LINK_LIBS[@]}" \
     -Wl,--end-group \
     -ldl -lrt -lpthread -lm -lz -ltinfo \
-    -o "$RS_BIN"
+    -o "$SM_BIN"
 
-echo "[rewrite-seeds] ✓ $RS_BIN ($(du -h "$RS_BIN" | cut -f1))"
+echo "[spec-mutate] ✓ $SM_BIN ($(du -h "$SM_BIN" | cut -f1))"

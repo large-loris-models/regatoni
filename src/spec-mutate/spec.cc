@@ -1,11 +1,11 @@
-#include "src/rewrite-seeds/spec.h"
+#include "src/spec-mutate/spec.h"
 
 #include "deps/nlohmann-json/json.hpp"
 
 #include <fstream>
 #include <sstream>
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 using nlohmann::json;
 
@@ -91,4 +91,4 @@ bool loadSpec(const std::string &path, Spec &out, std::string &err) {
   return true;
 }
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate

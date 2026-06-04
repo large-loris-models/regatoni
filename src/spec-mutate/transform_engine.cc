@@ -1,4 +1,4 @@
-#include "src/rewrite-seeds/transform_engine.h"
+#include "src/spec-mutate/transform_engine.h"
 
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -13,7 +13,7 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
 
-namespace rewrite_seeds {
+namespace spec_mutate {
 
 using namespace llvm;
 
@@ -361,4 +361,4 @@ bool applyTransform(Module &CM, ValueToValueMapTy &VMap,
   return false;
 }
 
-}  // namespace rewrite_seeds
+}  // namespace spec_mutate
