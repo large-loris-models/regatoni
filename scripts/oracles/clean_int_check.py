@@ -31,6 +31,12 @@ TARGET_INTRIN = re.compile(
     r"@llvm\.(?:x86|aarch64|arm|amdgcn|nvvm|ppc|hexagon|wasm|s390|mips"
     r"|riscv|ve|bpf|spv|loongarch)\."
 )
+# Generic intrinsics that scalar riscv64 cannot select -> backend-tv "error" and a
+# codegen-target report_fatal_error ("Cannot select: vscale" / read_register
+# illegal type). vscale needs +v; (read|write)_register are ABI/phys-reg specific.
+UNSELECTABLE_INTRIN = re.compile(
+    r"@llvm\.(?:vscale|read_register|write_register|read_volatile_register)\b"
+)
 # A call/invoke/callbr INSTRUCTION (opcode at start-of-instruction or after `=`),
 # NOT a `%call` value name. Matched per line.
 CALL_INSTR = re.compile(
@@ -46,6 +52,8 @@ def is_clean_int_func(text):
     if VECTOR.search(text):
         return False
     if TARGET_INTRIN.search(text):
+        return False
+    if UNSELECTABLE_INTRIN.search(text):
         return False
     for line in text.splitlines():
         if CALL_INSTR.match(line) and "@llvm." not in line:

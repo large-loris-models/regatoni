@@ -76,7 +76,10 @@ _oracle_process_one() {
     local ir_file="$1"
     local callback_fn="$2"
     local base
-    base="$(basename "$ir_file")"
+    # Parameter expansion, not $(basename …): this runs once per corpus file, so a
+    # fork-per-file adds up to tens of seconds of oracle warmup when the corpus
+    # holds the full .ll seed set (which is then skipped just below).
+    base="${ir_file##*/}"
 
     # Skip seed files from the LLVM test suite. Fuzzer-generated corpus
     # entries are hash-named with no extension; .ll files are pre-existing

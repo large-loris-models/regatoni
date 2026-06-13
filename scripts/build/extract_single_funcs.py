@@ -99,6 +99,11 @@ TARGET_INTRIN_RE = re.compile(
     r"@llvm\.(?:x86|aarch64|arm|amdgcn|nvvm|ppc|hexagon|wasm|s390|mips"
     r"|riscv|ve|bpf|spv|loongarch)\."
 )
+# Generic intrinsics scalar riscv64 can't select -> backend-tv error + codegen
+# report_fatal_error ("Cannot select: vscale" / read_register illegal type).
+UNSELECTABLE_INTRIN_RE = re.compile(
+    r"@llvm\.(?:vscale|read_register|write_register|read_volatile_register)\b"
+)
 
 
 def is_clean_int_func(text):
@@ -109,6 +114,8 @@ def is_clean_int_func(text):
     if VECTOR_RE.search(text):
         return False
     if TARGET_INTRIN_RE.search(text):
+        return False
+    if UNSELECTABLE_INTRIN_RE.search(text):
         return False
     for line in text.splitlines():
         if CALL_RE.match(line) and "@llvm." not in line:

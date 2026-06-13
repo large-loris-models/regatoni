@@ -176,10 +176,13 @@ fi
 
 ORACLE_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
 _oc_idx=0
+# Sets $_OC to the next free oracle core and advances the index. NB: assigns a
+# global rather than echoing — a `core=$(next_oracle_core)` form would run in a
+# subshell, so the index increment would not persist and every oracle would pin
+# to the same core.
 next_oracle_core() {
-    local c="${ORACLE_CORES[$_oc_idx]:-${ALL_CORES[0]}}"
+    _OC="${ORACLE_CORES[$_oc_idx]:-${ALL_CORES[0]}}"
     _oc_idx=$((_oc_idx + 1))
-    echo "$c"
 }
 
 # ── Check required binaries ─────────────────────────────────────────────────
@@ -404,7 +407,7 @@ declare -a ALIVE_USED_CORES=()
 ASAN_PID=""
 if (( RUN_MIDEND_ORACLES )); then
     for shard in $(seq 0 $((ALIVE_SHARDS - 1))); do
-        core="$(next_oracle_core)"
+        next_oracle_core; core="$_OC"
         log "Starting alive-tv oracle shard $shard on core $core..."
         taskset -c "$core" "$ORACLE_DIR/alive_tv.sh" "$CORPUS_DIR" "$shard" "$ALIVE_SHARDS" >> "$RUN_LOG" 2>&1 &
         pid=$!
@@ -414,7 +417,7 @@ if (( RUN_MIDEND_ORACLES )); then
         log "alive-tv oracle shard $shard PID: $pid (core $core)"
     done
 
-    asan_core="$(next_oracle_core)"
+    next_oracle_core; asan_core="$_OC"
     log "Starting ASAN oracle on core $asan_core..."
     taskset -c "$asan_core" "$ORACLE_DIR/asan_opt.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>&1 &
     ASAN_PID=$!
@@ -437,7 +440,7 @@ if (( BACKEND_TV_ENABLE )); then
         gisel_env=()
         [[ "$mode" == gisel ]] && gisel_env=("BACKEND_TV_GLOBAL_ISEL=1")
         for shard in $(seq 0 $((BACKEND_TV_SHARDS - 1))); do
-            core="$(next_oracle_core)"
+            next_oracle_core; core="$_OC"
             taskset -c "$core" env BACKEND_TV_ARCH="$BACKEND_TV_ARCH" \
                 BACKEND_TV_INT_ONLY="$BTV_INT_ONLY" "${gisel_env[@]}" \
                 "$ORACLE_DIR/backend_tv.sh" "$CORPUS_DIR" "$shard" "$BACKEND_TV_SHARDS" >> "$RUN_LOG" 2>&1 &
