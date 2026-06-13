@@ -30,6 +30,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
@@ -44,6 +45,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csetjmp>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -173,37 +175,59 @@ static void maybeFlushMutationStats() {
   }
 }
 
-// Append our default RISC-V features to each function's target-features attr, so
-// per-function attributes don't override the TargetMachine defaults (matches
-// run_backend.cpp::appendTargetFeatures in the backend-tv oracle).
-static void appendTargetFeatures(llvm::Module &M) {
+// Set OUR rv64 features on every function, REPLACING any existing target-features.
+// We deliberately do NOT append like backend-tv does: the mutator's
+// modify_attributes injects target-features (e.g. rv32-only `zcf`, or `+v`) that
+// conflict with rv64 and make codegen report_fatal_error. We're fuzzing isel for a
+// fixed rv64 feature set, not fuzzing the feature config.
+static void setTargetFeatures(llvm::Module &M) {
   for (llvm::Function &F : M) {
-    if (F.hasFnAttribute("target-features")) {
-      std::string cur =
-          F.getFnAttribute("target-features").getValueAsString().str();
-      F.addFnAttr("target-features", cur + "," + kFeatures);
-    }
+    F.removeFnAttr("target-features");
+    F.addFnAttr("target-features", kFeatures);
   }
 }
 
-// Run the input through riscv64 codegen. Returns false only if the pipeline
-// can't be set up; an assertion/crash inside codegen propagates (Centipede
-// treats it as a crash — a backend bug).
+// Make codegen report_fatal_error (e.g. "Cannot select", an unsupported feature)
+// non-fatal: skip the input rather than crash the worker. These are NOT the bugs
+// we're after — backend-tv finds miscompiles, and a real isel ASSERTION failure
+// still abort()s (the handler only intercepts report_fatal_error) and surfaces as
+// a Centipede crash. Memory leaked by the skipped longjmp is bounded by Centipede's
+// rss_limit (the worker is recycled).
+static thread_local std::jmp_buf g_codegen_jmp;
+static thread_local bool g_in_codegen = false;
+
+static void codegenFatalHandler(void *, const char *reason, bool) {
+  if (g_in_codegen) {
+    g_in_codegen = false;
+    std::longjmp(g_codegen_jmp, 1);
+  }
+  fprintf(stderr, "codegen_fuzz_target: fatal outside codegen: %s\n", reason);
+  abort();
+}
+
+// Run the input through riscv64 codegen. Returns false if the pipeline can't be
+// set up or a report_fatal_error fired (input skipped).
 static bool runCodegen(const llvm::Module &M) {
+  if (setjmp(g_codegen_jmp)) {     // report_fatal_error fired during codegen below
+    g_in_codegen = false;
+    return false;
+  }
   auto MClone = llvm::CloneModule(M);
   MClone->setTargetTriple(llvm::Triple(kTripleStr));
   MClone->setDataLayout(g_codegen_tm->createDataLayout());
-  appendTargetFeatures(*MClone);
+  setTargetFeatures(*MClone);
 
   llvm::SmallString<8192> AsmBuf;
   llvm::raw_svector_ostream OS(AsmBuf);
   llvm::legacy::PassManager PM;
-  if (g_codegen_tm->addPassesToEmitFile(PM, OS, /*DwoOut=*/nullptr,
-                                        llvm::CodeGenFileType::AssemblyFile,
-                                        /*DisableVerify=*/false))
-    return false;
-  PM.run(*MClone);
-  return true;
+  g_in_codegen = true;
+  bool setup_failed = g_codegen_tm->addPassesToEmitFile(
+      PM, OS, /*DwoOut=*/nullptr, llvm::CodeGenFileType::AssemblyFile,
+      /*DisableVerify=*/false);
+  if (!setup_failed)
+    PM.run(*MClone);
+  g_in_codegen = false;
+  return !setup_failed;
 }
 
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
@@ -213,6 +237,9 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmPrinters();
   llvm::InitializeAllAsmParsers();
+
+  // Intercept codegen report_fatal_error (see codegenFatalHandler).
+  llvm::install_fatal_error_handler(codegenFatalHandler);
 
   std::string Err;
   llvm::Triple TT(kTripleStr);
