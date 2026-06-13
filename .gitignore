@@ -17,6 +17,8 @@ archive/
 corpus/
 seeds/
 split_seeds/
+single_func_seeds/
+int_func_seeds/
 miscompilations/
 runs/
 /output/
