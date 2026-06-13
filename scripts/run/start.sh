@@ -143,23 +143,62 @@ mapfile -t ALL_CORES < <(detect_cores)
 FUZZER_CORES="${FUZZER_CORES:-${FUZZ_JOBS:-4}}"
 ALIVE_SHARDS=3
 
-# Layout: FUZZER_CORES fuzzer + ALIVE_SHARDS alive-tv + 1 ASAN.
-NEEDED=$(( FUZZER_CORES + ALIVE_SHARDS + 1 ))
+# ── Campaign shape (env-configurable) ───────────────────────────────────────
+# FUZZ_TARGET_KIND  opt      -> Centipede coverage on `opt -O2` (middle-end).
+#                   codegen  -> coverage on riscv64 backend codegen (isel) — use
+#                              this for the RISC-V isel hunt (codegen_fuzz_target).
+# ORACLE_SET        default      -> alive-tv (xALIVE_SHARDS) + ASAN, validating `opt`.
+#                   backend_only -> skip those (free their cores); backend-tv only.
+# BACKEND_TV_ENABLE 1 -> backend-tv (riscv64) oracle, BACKEND_TV_SHARDS hash-shards
+#                        each of SelectionDAG + GlobalISel (backend-tv is the slow
+#                        bottleneck, so scale shards up on big boxes).
+# Focused isel campaign on a 16-core box, e.g.:
+#   FUZZ_TARGET_KIND=codegen ORACLE_SET=backend_only BACKEND_TV_ENABLE=1 \
+#   BACKEND_TV_SHARDS=5 FUZZER_CORES=6 ./scripts/run/start.sh --seeds int_func_seeds
+FUZZ_TARGET_KIND="${FUZZ_TARGET_KIND:-opt}"
+ORACLE_SET="${ORACLE_SET:-default}"
+BACKEND_TV_ENABLE="${BACKEND_TV_ENABLE:-0}"
+BACKEND_TV_ARCH="${BACKEND_TV_ARCH:-riscv64}"
+BACKEND_TV_SHARDS="${BACKEND_TV_SHARDS:-1}"      # shards per isel mode
+
+RUN_MIDEND_ORACLES=1
+[[ "$ORACLE_SET" == backend_only ]] && RUN_MIDEND_ORACLES=0
+
+# Core accounting: fuzzer takes the first FUZZER_CORES; oracles are handed the
+# rest sequentially via next_oracle_core (wrapping to core 0 if oversubscribed).
+alive_n=$(( RUN_MIDEND_ORACLES ? ALIVE_SHARDS : 0 ))
+asan_n=$(( RUN_MIDEND_ORACLES ? 1 : 0 ))
+btv_n=$(( BACKEND_TV_ENABLE ? 2 * BACKEND_TV_SHARDS : 0 ))
+NEEDED=$(( FUZZER_CORES + alive_n + asan_n + btv_n ))
 if (( ${#ALL_CORES[@]} < NEEDED )); then
     log "WARNING: only ${#ALL_CORES[@]} cores available (need $NEEDED); oracles may share cores"
 fi
 
 ORACLE_CORES=("${ALL_CORES[@]:$FUZZER_CORES}")
-ASAN_CORE="${ORACLE_CORES[$ALIVE_SHARDS]:-${ALL_CORES[0]}}"
+_oc_idx=0
+next_oracle_core() {
+    local c="${ORACLE_CORES[$_oc_idx]:-${ALL_CORES[0]}}"
+    _oc_idx=$((_oc_idx + 1))
+    echo "$c"
+}
 
 # ── Check required binaries ─────────────────────────────────────────────────
 
-FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target"
+case "$FUZZ_TARGET_KIND" in
+    opt)     FUZZ_TARGET="$BUILD_OUT/opt_fuzz_target" ;;
+    codegen) FUZZ_TARGET="$BUILD_OUT/codegen_fuzz_target" ;;
+    *) log "ERROR: FUZZ_TARGET_KIND must be opt|codegen (got '$FUZZ_TARGET_KIND')"; exit 1 ;;
+esac
 ALIVE_HARNESS="$BUILD_OUT/opt_fuzz_target_alive2"
 ASAN_OPT="$LLVM_BUILD_ASAN/bin/opt"
 
+# Only require the binaries the chosen campaign actually uses.
+declare -a REQUIRED=( "fuzz target:$FUZZ_TARGET" "centipede:$CENTIPEDE_BIN" )
+(( RUN_MIDEND_ORACLES )) && REQUIRED+=( "alive-tv harness:$ALIVE_HARNESS" "ASAN opt:$ASAN_OPT" )
+(( BACKEND_TV_ENABLE )) && REQUIRED+=( "backend-tv:${BACKEND_TV_BIN:-$ARM_TV_BUILD/backend-tv}" )
+
 err=0
-for pair in "fuzz target:$FUZZ_TARGET" "alive-tv harness:$ALIVE_HARNESS" "ASAN opt:$ASAN_OPT" "centipede:$CENTIPEDE_BIN"; do
+for pair in "${REQUIRED[@]}"; do
     label="${pair%%:*}"
     path="${pair#*:}"
     if [[ ! -x "$path" ]]; then
@@ -171,6 +210,7 @@ if (( err )); then
     log "Aborting — missing binaries. Run the build scripts first."
     exit 1
 fi
+log "Fuzz target: $FUZZ_TARGET_KIND ($FUZZ_TARGET)   oracle set: $ORACLE_SET"
 
 record_pid() {
     local name="$1" pid="$2"
@@ -361,22 +401,53 @@ ORACLE_DIR="$SCRIPT_DIR/../oracles"
 
 declare -a ALIVE_PIDS=()
 declare -a ALIVE_USED_CORES=()
-for shard in $(seq 0 $((ALIVE_SHARDS - 1))); do
-    core="${ORACLE_CORES[$shard]:-${ALL_CORES[0]}}"
-    log "Starting alive-tv oracle shard $shard on core $core..."
-    taskset -c "$core" "$ORACLE_DIR/alive_tv.sh" "$CORPUS_DIR" "$shard" "$ALIVE_SHARDS" >> "$RUN_LOG" 2>&1 &
-    pid=$!
-    record_pid "alive_tv_$shard" "$pid"
-    ALIVE_PIDS+=("$pid")
-    ALIVE_USED_CORES+=("$core")
-    log "alive-tv oracle shard $shard PID: $pid (core $core)"
-done
+ASAN_PID=""
+if (( RUN_MIDEND_ORACLES )); then
+    for shard in $(seq 0 $((ALIVE_SHARDS - 1))); do
+        core="$(next_oracle_core)"
+        log "Starting alive-tv oracle shard $shard on core $core..."
+        taskset -c "$core" "$ORACLE_DIR/alive_tv.sh" "$CORPUS_DIR" "$shard" "$ALIVE_SHARDS" >> "$RUN_LOG" 2>&1 &
+        pid=$!
+        record_pid "alive_tv_$shard" "$pid"
+        ALIVE_PIDS+=("$pid")
+        ALIVE_USED_CORES+=("$core")
+        log "alive-tv oracle shard $shard PID: $pid (core $core)"
+    done
 
-log "Starting ASAN oracle on core $ASAN_CORE..."
-taskset -c "$ASAN_CORE" "$ORACLE_DIR/asan_opt.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>&1 &
-ASAN_PID=$!
-record_pid "asan_opt" "$ASAN_PID"
-log "ASAN oracle PID: $ASAN_PID (core $ASAN_CORE)"
+    asan_core="$(next_oracle_core)"
+    log "Starting ASAN oracle on core $asan_core..."
+    taskset -c "$asan_core" "$ORACLE_DIR/asan_opt.sh" "$CORPUS_DIR" >> "$RUN_LOG" 2>&1 &
+    ASAN_PID=$!
+    record_pid "asan_opt" "$ASAN_PID"
+    log "ASAN oracle PID: $ASAN_PID (core $asan_core)"
+else
+    log "ORACLE_SET=backend_only — skipping alive-tv + ASAN (cores freed for backend-tv)"
+fi
+
+# ── Optional backend-tv oracle: BACKEND_TV_SHARDS shards × {SelectionDAG, GlobalISel}
+declare -a BTV_PIDS=()
+declare -a BTV_USED_CORES=()
+if (( BACKEND_TV_ENABLE )); then
+    # INT_ONLY gate on: the fuzzer's rare mutated tail reintroduces ptr/call/etc.
+    # that would yield false "incorrect"/error verdicts. BACKEND_TV_INT_ONLY=0
+    # validates everything (non-integer campaign).
+    BTV_INT_ONLY="${BACKEND_TV_INT_ONLY:-1}"
+    log "Starting backend-tv ($BACKEND_TV_ARCH, ${BACKEND_TV_SHARDS} shards × dagisel+gisel, int_only=$BTV_INT_ONLY)..."
+    for mode in dagisel gisel; do
+        gisel_env=()
+        [[ "$mode" == gisel ]] && gisel_env=("BACKEND_TV_GLOBAL_ISEL=1")
+        for shard in $(seq 0 $((BACKEND_TV_SHARDS - 1))); do
+            core="$(next_oracle_core)"
+            taskset -c "$core" env BACKEND_TV_ARCH="$BACKEND_TV_ARCH" \
+                BACKEND_TV_INT_ONLY="$BTV_INT_ONLY" "${gisel_env[@]}" \
+                "$ORACLE_DIR/backend_tv.sh" "$CORPUS_DIR" "$shard" "$BACKEND_TV_SHARDS" >> "$RUN_LOG" 2>&1 &
+            pid=$!
+            record_pid "backend_tv_${mode}_$shard" "$pid"
+            BTV_PIDS+=("$pid"); BTV_USED_CORES+=("$core")
+            log "  backend_tv $mode shard $shard/$BACKEND_TV_SHARDS PID: $pid (core $core)"
+        done
+    done
+fi
 
 # ── Start log parser daemon ─────────────────────────────────────────────────
 
@@ -432,11 +503,14 @@ log ""
 log "═══════════════════════════════════════════════"
 log "  Fuzzing pipeline running"
 log "═══════════════════════════════════════════════"
-log "  fuzzer      PID $FUZZER_PID   cores ${ALL_CORES[*]:0:$FUZZER_CORES}"
+log "  fuzzer($FUZZ_TARGET_KIND)  PID $FUZZER_PID   cores ${ALL_CORES[*]:0:$FUZZER_CORES}"
 for i in "${!ALIVE_PIDS[@]}"; do
     log "  alive_tv_$i  PID ${ALIVE_PIDS[$i]}   core  ${ALIVE_USED_CORES[$i]}"
 done
-log "  asan_opt    PID $ASAN_PID   core  $ASAN_CORE"
+[[ -n "$ASAN_PID" ]] && log "  asan_opt    PID $ASAN_PID"
+if (( BACKEND_TV_ENABLE )); then
+    log "  backend_tv  $BACKEND_TV_ARCH ${BACKEND_TV_SHARDS}×(dagisel+gisel)  cores ${BTV_USED_CORES[*]}"
+fi
 log "───────────────────────────────────────────────"
 log "  run dir:    $RUN_DIR"
 log "  corpus:     $CORPUS_DIR"

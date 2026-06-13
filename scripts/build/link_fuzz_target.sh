@@ -84,6 +84,30 @@ $CXX "${FUZZ_CFLAGS[@]}" -std=c++17 -fno-rtti \
 echo "[link] ✓ $FUZZ_TARGET ($(du -h "$FUZZ_TARGET" | cut -f1))"
 
 ########################################
+# Codegen binary: sancov + Centipede runner, coverage on the riscv64 BACKEND
+# (isel/codegen) instead of opt -O2. Reuses the same sancov LLVM libs (opt links
+# all target backends, incl. RISCV CodeGen) and the same mutator sources.
+########################################
+
+CODEGEN_HARNESS_SRC="$PROJECT_ROOT/src/harness/codegen_fuzz_target.cc"
+CODEGEN_TARGET="$BUILD_OUT/codegen_fuzz_target"
+
+echo "[link] Compiling + linking codegen_fuzz_target (sancov, riscv64 backend)..."
+$CXX "${FUZZ_CFLAGS[@]}" -std=c++17 -fno-rtti \
+    "${MAIN_INCLUDES[@]}" \
+    "$CODEGEN_HARNESS_SRC" \
+    "${MUTATOR_SRCS[@]}" \
+    -fuse-ld=lld \
+    -Wl,--start-group \
+    "${LINK_LIBS[@]}" \
+    "$CENTIPEDE_RUNNER" \
+    -Wl,--end-group \
+    -ldl -lrt -lpthread -lm -lz -ltinfo \
+    -o "$CODEGEN_TARGET"
+
+echo "[link] ✓ $CODEGEN_TARGET ($(du -h "$CODEGEN_TARGET" | cut -f1))"
+
+########################################
 # Alive2 binary: ASAN+UBSAN, no sancov, no Centipede runner
 ########################################
 

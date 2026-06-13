@@ -45,6 +45,9 @@ export ALIVE_TV="$ALIVE2_BUILD/alive-tv"
 # Alive2 arm-tv (backend translation validation)
 export ARM_TV_BUILD="$PROJECT_ROOT/deps/alive2-arm-tv/build"
 export ARM_TV_BIN="$ARM_TV_BUILD/alive-tv"
+# backend-tv: validates the LLVM backend (codegen). One binary, two backends —
+# select with BACKEND_TV_ARCH=aarch64|riscv64 (consumed by scripts/oracles/backend_tv.sh).
+export BACKEND_TV_BIN="$ARM_TV_BUILD/backend-tv"
 
 # Plain LLVM tools
 export LLVM_BUILD_PLAIN="$PROJECT_ROOT/deps/llvm-build-plain"
