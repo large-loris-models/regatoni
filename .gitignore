@@ -54,3 +54,4 @@ CLAUDE.md
 FUZZER_MAP.md
 dedup.db*
 scripts/experiments
+*.csv
