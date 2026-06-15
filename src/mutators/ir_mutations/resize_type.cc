@@ -12,7 +12,9 @@ static bool isIntTarget(const llvm::BinaryOperator &BO) {
   if (!ty->isIntegerTy())
     return false;
   unsigned bw = ty->getIntegerBitWidth();
-  return bw >= 8 && bw <= 64;
+  // Widened from {8..64}: accept odd/narrow/wide integer sources too, so they
+  // can be re-legalized into a different (often illegal) width.
+  return bw >= 2 && bw <= 128;
 }
 
 static bool isFPTarget(const llvm::BinaryOperator &BO) {
@@ -56,8 +58,12 @@ bool ResizeType::apply(llvm::Module &M, std::mt19937 &rng) {
 
   if (origTy->isIntegerTy()) {
     unsigned bw = origTy->getIntegerBitWidth();
-    // Pick a different bit-width in {8,16,32,64} that isn't the current.
-    unsigned choices[] = {8, 16, 32, 64};
+    // Pick a different bit-width that isn't the current. Beyond the legal
+    // {8,16,32,64} we deliberately include odd / non-power-of-two / boundary
+    // widths: these force GISel legalization to split/extend/narrow (a
+    // bug-rich pass) and make dagisel vs gisel legalize divergently.
+    unsigned choices[] = {1,  3,  6,  7,  8,  16, 17,
+                          24, 31, 32, 33, 48, 63, 64, 128};
     std::vector<unsigned> opts;
     for (unsigned c : choices)
       if (c != bw)

@@ -9,14 +9,20 @@
 #include "src/mutators/ir_mutations/move_instruction.h"
 #include "src/mutators/ir_mutations/inline_call.h"
 #include "src/mutators/ir_mutations/remove_void_call.h"
-#include "src/mutators/ir_mutations/modify_attributes.h"
-#include "src/mutators/ir_mutations/mutate_gep.h"
 #include "src/mutators/ir_mutations/resize_type.h"
-#include "src/mutators/ir_mutations/mutate_unary.h"
 #include "src/mutators/ir_mutations/eliminate_undef.h"
-// Add new mutation headers here as you implement them:
-// #include "src/mutators/ir_mutations/change_constant.h"
-// #include "src/mutators/alive_mutations/modify_flags.h"
+// Scalar-integer / RISC-V isel-focused mutations:
+#include "src/mutators/ir_mutations/change_constant.h"
+#include "src/mutators/ir_mutations/mutate_shift_amount.h"
+#include "src/mutators/ir_mutations/wrap_bitmanip.h"
+// Pattern-selection mutations (SDAG-leaning / canonicalization divergence):
+#include "src/mutators/ir_mutations/arith_identity_substitution.h"
+#include "src/mutators/ir_mutations/narrow_then_widen.h"
+#include "src/mutators/ir_mutations/demote_intrinsic_to_expansion.h"
+// Pruned for the scalar-integer backend-isel campaign (2026-06-13):
+//   modify_attributes — injected interrupt/CC attrs -> backend-TV false positives
+//   mutate_gep        — pointer-only; never applies to the integer corpus
+//   mutate_unary      — FP-only (fneg); never applies to the integer corpus
 
 #include <algorithm>
 
@@ -73,13 +79,14 @@ MutationRegistry &MutationRegistry::instance() {
     reg.add(std::make_unique<MoveInstruction>());
     reg.add(std::make_unique<InlineCall>());
     reg.add(std::make_unique<RemoveVoidCall>());
-    reg.add(std::make_unique<ModifyAttributes>());
-    reg.add(std::make_unique<MutateGep>());
     reg.add(std::make_unique<ResizeType>());
-    reg.add(std::make_unique<MutateUnary>());
     reg.add(std::make_unique<EliminateUndef>());
-    // reg.add(std::make_unique<ChangeConstant>());
-    // reg.add(std::make_unique<ModifyFlags>());
+    reg.add(std::make_unique<ChangeConstant>());
+    reg.add(std::make_unique<MutateShiftAmount>());
+    reg.add(std::make_unique<WrapBitmanip>());
+    reg.add(std::make_unique<ArithIdentitySubstitution>());
+    reg.add(std::make_unique<NarrowThenWiden>());
+    reg.add(std::make_unique<DemoteIntrinsicToExpansion>());
     initialized = true;
   }
   return reg;
