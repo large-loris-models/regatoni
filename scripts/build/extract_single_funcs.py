@@ -104,6 +104,14 @@ TARGET_INTRIN_RE = re.compile(
 UNSELECTABLE_INTRIN_RE = re.compile(
     r"@llvm\.(?:vscale|read_register|write_register|read_volatile_register)\b"
 )
+# The "interrupt" function attribute makes a function an ISR (special
+# prologue/epilogue + mret/sret/uret return) that backend-tv models
+# inconsistently -> spurious "Value mismatch" (the isr_user cluster). Drop it.
+INTERRUPT_ATTR_RE = re.compile(r'"interrupt"')
+# undef / poison constants in the body -> refinement false positives that
+# --disable-undef-input can't cover (undef shift amounts, `freeze poison`).
+# ~2.9% of the clean-int corpus; small seed cost for killing two noise classes.
+UNDEF_POISON_RE = re.compile(r"\b(?:undef|poison)\b")
 
 
 def is_clean_int_func(text):
@@ -116,6 +124,10 @@ def is_clean_int_func(text):
     if TARGET_INTRIN_RE.search(text):
         return False
     if UNSELECTABLE_INTRIN_RE.search(text):
+        return False
+    if INTERRUPT_ATTR_RE.search(text):
+        return False
+    if UNDEF_POISON_RE.search(text):
         return False
     for line in text.splitlines():
         if CALL_RE.match(line) and "@llvm." not in line:
