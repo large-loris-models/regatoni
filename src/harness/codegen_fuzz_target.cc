@@ -58,9 +58,16 @@
 
 static llvm::LLVMContext *Ctx = nullptr;
 
-// riscv64 codegen target machine, built once and reused (Centipede runs inputs
-// serially per worker).
-static llvm::TargetMachine *g_codegen_tm = nullptr;
+// riscv64 codegen target machines, built once and reused (Centipede runs inputs
+// serially per worker). We keep BOTH isel pipelines so a single fuzzing run
+// drives — and gathers coverage over — SelectionDAG *and* GlobalISel: a test
+// case that's interesting for one backend is almost always interesting for the
+// other, and SDAG (the default/production isel for RISC-V) is the higher-value
+// target. Which to run is set by CODEGEN_ISEL=dag|gisel|both (default both).
+static llvm::TargetMachine *g_tm_dag = nullptr;   // SelectionDAG isel
+static llvm::TargetMachine *g_tm_gisel = nullptr; // GlobalISel isel
+static bool g_run_dag = true;
+static bool g_run_gisel = true;
 static const char *kTripleStr = "riscv64-unknown-linux-gnu";
 static const char *kCPU = "generic";
 static const char *kFeatures = "+c,+m,+b,+f,+d,+q,+zfh";
@@ -205,29 +212,42 @@ static void codegenFatalHandler(void *, const char *reason, bool) {
   abort();
 }
 
-// Run the input through riscv64 codegen. Returns false if the pipeline can't be
-// set up or a report_fatal_error fired (input skipped).
-static bool runCodegen(const llvm::Module &M) {
+// Run the input through one backend's codegen for coverage (the emitted asm is
+// discarded — we only want the instrumented codegen path to execute). Its own
+// setjmp guard so a report_fatal_error in one backend doesn't skip the other.
+static bool runOneBackend(const llvm::Module &M, llvm::TargetMachine *TM) {
   if (setjmp(g_codegen_jmp)) {     // report_fatal_error fired during codegen below
     g_in_codegen = false;
     return false;
   }
   auto MClone = llvm::CloneModule(M);
   MClone->setTargetTriple(llvm::Triple(kTripleStr));
-  MClone->setDataLayout(g_codegen_tm->createDataLayout());
+  MClone->setDataLayout(TM->createDataLayout());
   setTargetFeatures(*MClone);
 
   llvm::SmallString<8192> AsmBuf;
   llvm::raw_svector_ostream OS(AsmBuf);
   llvm::legacy::PassManager PM;
   g_in_codegen = true;
-  bool setup_failed = g_codegen_tm->addPassesToEmitFile(
+  bool setup_failed = TM->addPassesToEmitFile(
       PM, OS, /*DwoOut=*/nullptr, llvm::CodeGenFileType::AssemblyFile,
       /*DisableVerify=*/false);
   if (!setup_failed)
     PM.run(*MClone);
   g_in_codegen = false;
   return !setup_failed;
+}
+
+// Run the input through both isel pipelines (per CODEGEN_ISEL). Coverage from
+// both accumulates, so Centipede steers the corpus toward inputs interesting to
+// either backend. Returns true if at least one pipeline ran.
+static bool runCodegen(const llvm::Module &M) {
+  bool ok = false;
+  if (g_run_dag)
+    ok |= runOneBackend(M, g_tm_dag);
+  if (g_run_gisel)
+    ok |= runOneBackend(M, g_tm_gisel);
+  return ok;
 }
 
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
@@ -250,21 +270,43 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   }
   llvm::TargetOptions Opt;
   Opt.FloatABIType = llvm::FloatABI::Hard;
-  g_codegen_tm = T->createTargetMachine(TT, kCPU, kFeatures, Opt,
-                                        /*RM=*/std::nullopt);
-  if (!g_codegen_tm) {
-    fprintf(stderr, "codegen_fuzz_target: failed to build TargetMachine\n");
-    abort();
-  }
-  g_codegen_tm->setMachineOutliner(false);
-  g_codegen_tm->setSupportsDefaultOutlining(false);
+  auto buildTM = [&](bool gisel) -> llvm::TargetMachine * {
+    llvm::TargetMachine *tm = T->createTargetMachine(TT, kCPU, kFeatures, Opt,
+                                                     /*RM=*/std::nullopt);
+    if (!tm) {
+      fprintf(stderr, "codegen_fuzz_target: failed to build TargetMachine\n");
+      abort();
+    }
+    tm->setMachineOutliner(false);
+    tm->setSupportsDefaultOutlining(false);
+    if (gisel) {
+      // Abort disabled so known GISel gaps fall back to SelectionDAG rather
+      // than crashing the fuzzer.
+      tm->setGlobalISel(true);
+      tm->setGlobalISelAbort(llvm::GlobalISelAbortMode::Disable);
+    }
+    return tm;
+  };
+  g_tm_dag = buildTM(/*gisel=*/false);
+  g_tm_gisel = buildTM(/*gisel=*/true);
 
-  // GlobalISel path (env opt-in). Abort disabled so known GISel gaps fall back
-  // to SelectionDAG rather than crashing the fuzzer.
-  if (const char *e = getenv("CODEGEN_GLOBAL_ISEL"); e && *e && *e != '0') {
-    g_codegen_tm->setGlobalISel(true);
-    g_codegen_tm->setGlobalISelAbort(llvm::GlobalISelAbortMode::Disable);
+  // Which isel pipeline(s) to drive for coverage. Default: both (SDAG + GISel),
+  // so one run hunts both backends. CODEGEN_GLOBAL_ISEL=1 is kept as a back-compat
+  // alias for CODEGEN_ISEL=gisel.
+  if (const char *e = getenv("CODEGEN_ISEL")) {
+    std::string mode(e);
+    g_run_dag = (mode == "dag" || mode == "both");
+    g_run_gisel = (mode == "gisel" || mode == "both");
+    if (!g_run_dag && !g_run_gisel) { // unrecognized value -> default both
+      g_run_dag = g_run_gisel = true;
+    }
+  } else if (const char *g = getenv("CODEGEN_GLOBAL_ISEL"); g && *g && *g != '0') {
+    g_run_dag = false;
+    g_run_gisel = true;
   }
+  fprintf(stderr, "codegen_fuzz_target: isel coverage = %s%s%s\n",
+          g_run_dag ? "dag" : "", (g_run_dag && g_run_gisel) ? "+" : "",
+          g_run_gisel ? "gisel" : "");
 
   (void)regatoni::MutationRegistry::instance();
   initMutationStats();
