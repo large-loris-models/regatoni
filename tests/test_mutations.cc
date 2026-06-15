@@ -16,11 +16,14 @@
 #include "src/mutators/ir_mutations/move_instruction.h"
 #include "src/mutators/ir_mutations/inline_call.h"
 #include "src/mutators/ir_mutations/remove_void_call.h"
-#include "src/mutators/ir_mutations/modify_attributes.h"
-#include "src/mutators/ir_mutations/mutate_gep.h"
 #include "src/mutators/ir_mutations/resize_type.h"
-#include "src/mutators/ir_mutations/mutate_unary.h"
 #include "src/mutators/ir_mutations/eliminate_undef.h"
+#include "src/mutators/ir_mutations/change_constant.h"
+#include "src/mutators/ir_mutations/mutate_shift_amount.h"
+#include "src/mutators/ir_mutations/wrap_bitmanip.h"
+#include "src/mutators/ir_mutations/arith_identity_substitution.h"
+#include "src/mutators/ir_mutations/narrow_then_widen.h"
+#include "src/mutators/ir_mutations/demote_intrinsic_to_expansion.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -841,186 +844,8 @@ static void testRemoveVoidCallNoTargets() {
 }
 
 // ============================================================================
-// Test: ModifyAttributes
+// Test: MutateGep (REMOVED — pointer-only, pruned from the integer campaign)
 // ============================================================================
-
-static void testModifyAttributes() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define i32 @f(i32 %a, i32 %b) {
-      %x = add i32 %a, %b
-      ret i32 %x
-    }
-  )");
-
-  ModifyAttributes mut;
-  assert(mut.canApply(*M) && "ModifyAttributes should apply");
-
-  bool anyChanged = false;
-  for (int seed = 0; seed < 30; ++seed) {
-    LLVMContext C2;
-    auto M2 = parseIR(C2, R"(
-      define i32 @f(i32 %a, i32 %b) {
-        %x = add i32 %a, %b
-        ret i32 %x
-      }
-    )");
-    std::string before = moduleToString(*M2);
-    std::mt19937 rng(seed);
-    mut.apply(*M2, rng);
-    std::string after = moduleToString(*M2);
-    if (before != after)
-      anyChanged = true;
-    assert(isValid(*M2) && "Module should still be valid after mutation");
-  }
-  assert(anyChanged && "ModifyAttributes should change something across seeds");
-
-  std::cout << "  [PASS] ModifyAttributes: toggles attrs, result is valid IR\n";
-}
-
-static void testModifyAttributesNoTargets() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define void @f(float %a) {
-      ret void
-    }
-  )");
-
-  ModifyAttributes mut;
-  assert(!mut.canApply(*M) && "ModifyAttributes should not apply");
-
-  std::cout
-      << "  [PASS] ModifyAttributes: rejects module with no integer slots\n";
-}
-
-// ============================================================================
-// Test: MutateGep
-// ============================================================================
-
-static void testMutateGep() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define ptr @f(ptr %p, i64 %i) {
-      %q = getelementptr inbounds i32, ptr %p, i64 %i
-      %r = getelementptr inbounds [4 x i32], ptr %q, i64 0, i64 2
-      ret ptr %r
-    }
-  )");
-
-  MutateGep mut;
-  assert(mut.canApply(*M) && "MutateGep should apply");
-
-  bool anyChanged = false;
-  for (int seed = 0; seed < 30; ++seed) {
-    LLVMContext C2;
-    auto M2 = parseIR(C2, R"(
-      define ptr @f(ptr %p, i64 %i) {
-        %q = getelementptr inbounds i32, ptr %p, i64 %i
-        %r = getelementptr inbounds [4 x i32], ptr %q, i64 0, i64 2
-        ret ptr %r
-      }
-    )");
-    std::string before = moduleToString(*M2);
-    std::mt19937 rng(seed);
-    if (mut.apply(*M2, rng)) {
-      std::string after = moduleToString(*M2);
-      if (before != after)
-        anyChanged = true;
-    }
-    assert(isValid(*M2) && "Module should still be valid after mutation");
-  }
-  assert(anyChanged && "MutateGep should change something across seeds");
-
-  std::cout << "  [PASS] MutateGep: mutates gep, result is valid IR\n";
-}
-
-// Regression: if we perturb a constant index on an `inbounds` GEP, the
-// result must no longer claim `inbounds`. Otherwise we risk silently
-// generating UB inputs that opt is free to miscompile around, wasting
-// Alive2 triage time. alive-mutate sidesteps this by only toggling the
-// flag; we keep index mutation but drop `inbounds` whenever we touch an
-// index.
-static void testMutateGepClearsInboundsOnIndexMutation() {
-  // A GEP whose ONLY constant-index mutation target is the `i64 2`, on an
-  // inbounds GEP. Run many seeds; every index-mutation outcome must have
-  // `inbounds` cleared, every inbounds-toggle outcome must still be valid.
-  const char *kIR = R"(
-    define ptr @f(ptr %p) {
-      %q = getelementptr inbounds [4 x i32], ptr %p, i64 0, i64 2
-      ret ptr %q
-    }
-  )";
-  MutateGep mut;
-  int sawIndexMutation = 0;
-  int sawInboundsToggle = 0;
-  for (int seed = 0; seed < 200; ++seed) {
-    LLVMContext Ctx;
-    auto M = parseIR(Ctx, kIR);
-    std::mt19937 rng(seed);
-    mut.apply(*M, rng);
-    assert(isValid(*M));
-    auto *F = M->getFunction("f");
-    auto *gep =
-        llvm::cast<llvm::GetElementPtrInst>(&*F->begin()->begin());
-    auto *CI = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(2));
-    assert(CI && "final index must remain a constant");
-    bool indexChanged = CI->getValue().getSExtValue() != 2;
-    bool inboundsFlipped = !gep->isInBounds();
-    if (indexChanged) {
-      ++sawIndexMutation;
-      assert(!gep->isInBounds() &&
-             "index mutation must clear inbounds to avoid UB");
-    } else if (inboundsFlipped) {
-      ++sawInboundsToggle;
-    }
-  }
-  assert(sawIndexMutation > 0 &&
-         "should exercise the index-mutation path in 200 seeds");
-  assert(sawInboundsToggle > 0 &&
-         "should exercise the inbounds-toggle path in 200 seeds");
-  std::cout
-      << "  [PASS] MutateGep: index-mutation path always clears inbounds ("
-      << sawIndexMutation << " idx, " << sawInboundsToggle << " flag)\n";
-}
-
-static void testMutateGepNarrowIndex() {
-  // Regression: narrow-width constant index (e.g. i8 at its max) must not
-  // trigger APInt bit-width assertion when the mutation adds/subtracts a delta.
-  for (int seed = 0; seed < 30; ++seed) {
-    LLVMContext Ctx;
-    auto M = parseIR(Ctx, R"(
-      define ptr @f(ptr %p) {
-        %q = getelementptr i32, ptr %p, i8 127
-        %r = getelementptr i32, ptr %q, i8 -128
-        ret ptr %r
-      }
-    )");
-    MutateGep mut;
-    assert(mut.canApply(*M));
-    std::mt19937 rng(seed);
-    mut.apply(*M, rng);
-    assert(isValid(*M) && "Module should be valid after narrow-index mutation");
-  }
-  std::cout << "  [PASS] MutateGep: narrow-width index does not overflow\n";
-}
-
-static void testMutateGepNoTargets() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define i32 @f(i32 %a) {
-      ret i32 %a
-    }
-  )");
-
-  MutateGep mut;
-  assert(!mut.canApply(*M) && "MutateGep should not apply without gep");
-
-  std::cout << "  [PASS] MutateGep: rejects module with no gep\n";
-}
 
 // ============================================================================
 // Test: ResizeType
@@ -1067,51 +892,6 @@ static void testResizeTypeNoTargets() {
   assert(!mut.canApply(*M) && "ResizeType should not apply");
 
   std::cout << "  [PASS] ResizeType: rejects module with no targets\n";
-}
-
-// ============================================================================
-// Test: MutateUnary
-// ============================================================================
-
-static void testMutateUnary() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define float @f(float %x, float %y) {
-      %r = fadd float %x, %y
-      ret float %r
-    }
-  )");
-
-  MutateUnary mut;
-  assert(mut.canApply(*M) && "MutateUnary should apply");
-
-  std::string before = moduleToString(*M);
-  std::mt19937 rng(5);
-  bool changed = mut.apply(*M, rng);
-  std::string after = moduleToString(*M);
-
-  assert(changed && "MutateUnary should change something");
-  assert(before != after && "Module should differ after mutation");
-  assert(isValid(*M) && "Module should still be valid after mutation");
-
-  std::cout << "  [PASS] MutateUnary: replaces with fneg, result is valid IR\n";
-}
-
-static void testMutateUnaryNoTargets() {
-  LLVMContext Ctx;
-
-  auto M = parseIR(Ctx, R"(
-    define i32 @f(i32 %a, i32 %b) {
-      %r = add i32 %a, %b
-      ret i32 %r
-    }
-  )");
-
-  MutateUnary mut;
-  assert(!mut.canApply(*M) && "MutateUnary should not apply");
-
-  std::cout << "  [PASS] MutateUnary: rejects module with no FP binops\n";
 }
 
 // ============================================================================
@@ -1197,6 +977,353 @@ static void testEliminateUndefNoTargets() {
   assert(!mut.canApply(*M) && "EliminateUndef should not apply");
 
   std::cout << "  [PASS] EliminateUndef: rejects module with no undef\n";
+}
+
+// ============================================================================
+// Test: ChangeConstant
+// ============================================================================
+
+static void testChangeConstant() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a) {
+      %x = add i32 %a, 5
+      %c = icmp slt i32 %x, 100
+      %s = select i1 %c, i32 %x, i32 7
+      ret i32 %s
+    }
+  )");
+  ChangeConstant mut;
+  assert(mut.canApply(*M) && "ChangeConstant should apply with int constants");
+  std::string before = moduleToString(*M);
+  std::mt19937 rng(13);
+  bool changed = mut.apply(*M, rng);
+  assert(changed && "ChangeConstant should change a constant");
+  assert(before != moduleToString(*M) && "Module should differ");
+  assert(isValid(*M) && "Module should still be valid after mutation");
+  std::cout << "  [PASS] ChangeConstant: rewrites a constant, result is valid IR\n";
+}
+
+// Stress: many seeds over constant-rich IR (incl. narrow i8 + SWAR magic
+// 65793). Every outcome must verify — APInt width handling must be correct.
+static void testChangeConstantStress() {
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i8 %b) {
+      %x = add i32 %a, 5
+      %y = mul i32 %x, 65793
+      %c = icmp ult i32 %y, 255
+      %s = select i1 %c, i32 %y, i32 -1
+      %t = and i8 %b, 15
+      %z = add i32 %s, 0
+      ret i32 %z
+    }
+  )";
+  ChangeConstant mut;
+  for (int seed = 0; seed < 300; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] ChangeConstant invalid IR (seed " << seed << "):\n"
+                << moduleToString(*M);
+      assert(false);
+    }
+  }
+  std::cout << "  [PASS] ChangeConstant: 300 seeds (incl. i8), all valid\n";
+}
+
+static void testChangeConstantNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add i32 %a, %b
+      ret i32 %x
+    }
+  )");
+  ChangeConstant mut;
+  assert(!mut.canApply(*M) &&
+         "ChangeConstant should not apply without integer constants");
+  std::cout << "  [PASS] ChangeConstant: rejects module with no int constants\n";
+}
+
+// ============================================================================
+// Test: MutateShiftAmount
+// ============================================================================
+
+static void testMutateShiftAmount() {
+  MutateShiftAmount mut;
+  const char *kIR = R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = shl i32 %a, %b
+      %y = lshr i32 %x, 3
+      %z = ashr i32 %y, %a
+      ret i32 %z
+    }
+  )";
+  {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    assert(mut.canApply(*M) && "MutateShiftAmount should apply to shifts");
+  }
+  bool anyChanged = false;
+  for (int seed = 0; seed < 40; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::string before = moduleToString(*M);
+    std::mt19937 rng(seed);
+    if (mut.apply(*M, rng) && moduleToString(*M) != before)
+      anyChanged = true;
+    assert(isValid(*M) && "Module should still be valid after mutation");
+  }
+  assert(anyChanged && "MutateShiftAmount should change a shift amount");
+  std::cout << "  [PASS] MutateShiftAmount: sets boundary amounts, result valid\n";
+}
+
+static void testMutateShiftAmountFunnel() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    declare i32 @llvm.fshl.i32(i32, i32, i32)
+    define i32 @g(i32 %a, i32 %b, i32 %c) {
+      %r = call i32 @llvm.fshl.i32(i32 %a, i32 %b, i32 %c)
+      ret i32 %r
+    }
+  )");
+  MutateShiftAmount mut;
+  assert(mut.canApply(*M) && "should apply to funnel-shift intrinsic");
+  std::mt19937 rng(1);
+  bool changed = mut.apply(*M, rng);
+  assert(changed && "should set the rotate amount");
+  assert(isValid(*M) && "Module should still be valid after mutation");
+  std::cout << "  [PASS] MutateShiftAmount: handles fshl rotate amount\n";
+}
+
+static void testMutateShiftAmountNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add i32 %a, %b
+      ret i32 %x
+    }
+  )");
+  MutateShiftAmount mut;
+  assert(!mut.canApply(*M) && "should not apply without shifts");
+  std::cout << "  [PASS] MutateShiftAmount: rejects module with no shifts\n";
+}
+
+// ============================================================================
+// Test: WrapBitmanip
+// ============================================================================
+
+static void testWrapBitmanip() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add i32 %a, %b
+      %y = mul i32 %x, %b
+      ret i32 %y
+    }
+  )");
+  WrapBitmanip mut;
+  assert(mut.canApply(*M) && "WrapBitmanip should apply to int instructions");
+  std::string before = moduleToString(*M);
+  std::mt19937 rng(2);
+  bool changed = mut.apply(*M, rng);
+  assert(changed && "WrapBitmanip should wrap a value");
+  assert(before != moduleToString(*M) && "Module should differ");
+  assert(isValid(*M) && "Module must verify (no self-reference / broken SSA)");
+  std::cout << "  [PASS] WrapBitmanip: wraps a value in a bitmanip idiom, valid\n";
+}
+
+// Stress: i8/i16/i32/i64 values exercise every idiom branch — bswap (only on
+// multiple-of-16 widths), funnel-rotate, and the pure-IR idioms. The use-
+// rewiring must never create a self-reference, so every result must verify.
+static void testWrapBitmanipStress() {
+  const char *kIR = R"(
+    define i64 @f(i8 %a, i16 %b, i32 %c, i64 %d) {
+      %x8  = add i8 %a, 1
+      %x16 = add i16 %b, 1
+      %x32 = add i32 %c, 1
+      %x64 = add i64 %d, 1
+      %u8  = zext i8 %x8 to i64
+      %u16 = zext i16 %x16 to i64
+      %u32 = zext i32 %x32 to i64
+      %s1  = add i64 %u8, %u16
+      %s2  = add i64 %u32, %x64
+      %r   = add i64 %s1, %s2
+      ret i64 %r
+    }
+  )";
+  WrapBitmanip mut;
+  for (int seed = 0; seed < 400; ++seed) {
+    LLVMContext Ctx;
+    auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    mut.apply(*M, rng);
+    if (!isValid(*M)) {
+      std::cerr << "  [FAIL] WrapBitmanip invalid IR (seed " << seed << "):\n"
+                << moduleToString(*M);
+      assert(false);
+    }
+  }
+  std::cout << "  [PASS] WrapBitmanip: 400 seeds across i8/i16/i32/i64, all valid\n";
+}
+
+static void testWrapBitmanipNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a) {
+      ret i32 %a
+    }
+  )");
+  WrapBitmanip mut;
+  assert(!mut.canApply(*M) &&
+         "WrapBitmanip should not apply with no wrappable instructions");
+  std::cout << "  [PASS] WrapBitmanip: rejects module with no wrappable values\n";
+}
+
+// ============================================================================
+// Test: ArithIdentitySubstitution
+// ============================================================================
+
+static void testArithIdentitySubstitution() {
+  // Each line matches one rewrite pattern; many seeds must all stay valid and
+  // (collectively) change something.
+  const char *kIR = R"(
+    define i32 @f(i32 %x) {
+      %a = mul i32 %x, 8
+      %b = shl i32 %a, 3
+      %c = add i32 %b, %b
+      %d = mul i32 %c, -1
+      %e = sub i32 0, %d
+      ret i32 %e
+    }
+  )";
+  ArithIdentitySubstitution mut;
+  {
+    LLVMContext Ctx; auto M = parseIR(Ctx, kIR);
+    assert(mut.canApply(*M) && "should apply to mul/shl/add-self/sub-0 forms");
+  }
+  bool anyChanged = false;
+  for (int seed = 0; seed < 60; ++seed) {
+    LLVMContext Ctx; auto M = parseIR(Ctx, kIR);
+    std::string before = moduleToString(*M);
+    std::mt19937 rng(seed);
+    if (mut.apply(*M, rng) && moduleToString(*M) != before) anyChanged = true;
+    assert(isValid(*M) && "result must be valid IR");
+  }
+  assert(anyChanged && "should rewrite a form across seeds");
+  std::cout << "  [PASS] ArithIdentitySubstitution: rewrites equivalent forms, valid\n";
+}
+
+static void testArithIdentityNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = mul i32 %a, 3
+      %y = and i32 %x, %b
+      ret i32 %y
+    }
+  )");
+  ArithIdentitySubstitution mut; // mul by 3 (non-pow2), and -> no rewrite
+  assert(!mut.canApply(*M) && "should not apply without a recognized form");
+  std::cout << "  [PASS] ArithIdentitySubstitution: rejects non-matching IR\n";
+}
+
+// ============================================================================
+// Test: NarrowThenWiden
+// ============================================================================
+
+static void testNarrowThenWiden() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i64 @f(i64 %a, i64 %b) {
+      %x = add i64 %a, %b
+      %y = mul i64 %x, %b
+      ret i64 %y
+    }
+  )");
+  NarrowThenWiden mut;
+  assert(mut.canApply(*M) && "should apply to >32-bit binops");
+  std::string before = moduleToString(*M);
+  std::mt19937 rng(1);
+  bool changed = mut.apply(*M, rng);
+  assert(changed && "should rewrite a wide binop");
+  assert(before != moduleToString(*M) && "module should differ");
+  assert(isValid(*M) && "result must be valid IR (trunc/op/sext)");
+  std::cout << "  [PASS] NarrowThenWiden: sext(op(trunc,trunc)), valid\n";
+}
+
+static void testNarrowThenWidenNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add i32 %a, %b
+      ret i32 %x
+    }
+  )");
+  NarrowThenWiden mut; // i32 is not > 32 bits
+  assert(!mut.canApply(*M) && "should not apply to <=32-bit binops");
+  std::cout << "  [PASS] NarrowThenWiden: rejects <=32-bit binops\n";
+}
+
+// ============================================================================
+// Test: DemoteIntrinsicToExpansion
+// ============================================================================
+
+static void testDemoteIntrinsicToExpansion() {
+  DemoteIntrinsicToExpansion mut;
+  const char *kIR = R"(
+    declare i32 @llvm.ctpop.i32(i32)
+    declare i64 @llvm.bswap.i64(i64)
+    declare i16 @llvm.bswap.i16(i16)
+    define i64 @f(i32 %a, i64 %b, i16 %c) {
+      %p = call i32 @llvm.ctpop.i32(i32 %a)
+      %s = call i64 @llvm.bswap.i64(i64 %b)
+      %t = call i16 @llvm.bswap.i16(i16 %c)
+      %pz = zext i32 %p to i64
+      %tz = zext i16 %t to i64
+      %r1 = add i64 %s, %pz
+      %r2 = add i64 %r1, %tz
+      ret i64 %r2
+    }
+  )";
+  {
+    LLVMContext Ctx; auto M = parseIR(Ctx, kIR);
+    assert(mut.canApply(*M) && "should apply to ctpop/bswap calls");
+  }
+  // Apply repeatedly across seeds; every expansion must verify, and after
+  // enough applications all three intrinsic calls are gone.
+  bool anyChanged = false;
+  for (int seed = 0; seed < 40; ++seed) {
+    LLVMContext Ctx; auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(seed);
+    if (mut.apply(*M, rng)) anyChanged = true;
+    assert(isValid(*M) && "expansion must be valid IR");
+  }
+  assert(anyChanged && "should expand an intrinsic");
+  // Drain all of them on one module.
+  {
+    LLVMContext Ctx; auto M = parseIR(Ctx, kIR);
+    std::mt19937 rng(0);
+    for (int i = 0; i < 10 && mut.canApply(*M); ++i) mut.apply(*M, rng);
+    assert(!mut.canApply(*M) && "all ctpop/bswap should be expanded");
+    assert(isValid(*M));
+  }
+  std::cout << "  [PASS] DemoteIntrinsicToExpansion: expands ctpop/bswap, valid\n";
+}
+
+static void testDemoteIntrinsicNoTargets() {
+  LLVMContext Ctx;
+  auto M = parseIR(Ctx, R"(
+    define i32 @f(i32 %a, i32 %b) {
+      %x = add i32 %a, %b
+      ret i32 %x
+    }
+  )");
+  DemoteIntrinsicToExpansion mut;
+  assert(!mut.canApply(*M) && "should not apply without ctpop/bswap");
+  std::cout << "  [PASS] DemoteIntrinsicToExpansion: rejects IR with no targets\n";
 }
 
 // ============================================================================
@@ -1336,19 +1463,26 @@ int main() {
   testInlineCall();
   testRemoveVoidCall();
   testRemoveVoidCallNoTargets();
-  testModifyAttributes();
-  testModifyAttributesNoTargets();
-  testMutateGep();
-  testMutateGepClearsInboundsOnIndexMutation();
-  testMutateGepNarrowIndex();
-  testMutateGepNoTargets();
   testResizeType();
   testResizeTypeNoTargets();
-  testMutateUnary();
-  testMutateUnaryNoTargets();
   testEliminateUndef();
   testEliminateUndefDominanceMultiBB();
   testEliminateUndefNoTargets();
+  testChangeConstant();
+  testChangeConstantStress();
+  testChangeConstantNoTargets();
+  testMutateShiftAmount();
+  testMutateShiftAmountFunnel();
+  testMutateShiftAmountNoTargets();
+  testWrapBitmanip();
+  testWrapBitmanipStress();
+  testWrapBitmanipNoTargets();
+  testArithIdentitySubstitution();
+  testArithIdentityNoTargets();
+  testNarrowThenWiden();
+  testNarrowThenWidenNoTargets();
+  testDemoteIntrinsicToExpansion();
+  testDemoteIntrinsicNoTargets();
   testMutationComposability();
   testMutationChainStress();
   testRegistry();
