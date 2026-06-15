@@ -57,6 +57,7 @@ if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
         ccache \
         re2c \
         libz3-dev \
+        libhiredis-dev \
         antlr4 libantlr4-runtime-dev
 
 

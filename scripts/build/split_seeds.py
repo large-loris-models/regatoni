@@ -64,6 +64,11 @@ def split_top_level(text):
                 chunks.append(('declare', name, line))
             elif stripped.startswith('target '):
                 chunks.append(('target', '', line))
+            elif stripped.startswith('%'):
+                # Named type definition (e.g. `%struct.Foo = type { ... }`).
+                # Only type defs appear at top level with a `%` sigil.
+                m = re.match(r'%("[^"]+"|[\w.$-]+)', stripped)
+                chunks.append(('type', m.group(1).strip('"') if m else '', line))
             elif stripped.startswith('@'):
                 m = re.match(r'@("[^"]+"|[\w.$-]+)', stripped)
                 name = m.group(1).strip('"') if m else ''
@@ -121,6 +126,7 @@ def process_file(path, out_dir):
         return 0, f'parse error: {e}'
 
     targets = [c for c in chunks if c[0] == 'target']
+    types_ = [c for c in chunks if c[0] == 'type']
     globals_ = [c for c in chunks if c[0] == 'global']
     declares = [c for c in chunks if c[0] == 'declare']
     defines = [c for c in chunks if c[0] == 'define']
@@ -135,6 +141,11 @@ def process_file(path, out_dir):
         ats, _, _ = referenced_names(body)
         out_parts = []
         out_parts.extend(c[2] for c in targets)
+        # Named types are cheap and legal even when unused; emit all of them so
+        # a function that references a struct/landingpad type never lands in a
+        # fragment with the definition missing (an undefined type aborts the
+        # assertions-enabled LLVM parser the harness uses).
+        out_parts.extend(c[2] for c in types_)
         for c in globals_:
             if c[1] in ats:
                 out_parts.append(c[2])
