@@ -55,4 +55,10 @@ CLAUDE.md
 /experiments/
 FUZZER_MAP.md
 dedup.db*
-scripts/experiments
+scripts/experimentstriage_candidates/
+combined_int_seeds/
+riscv_codegen_seeds/
+riscv_codegen_single_seeds/
+riscv_codegen_int_seeds/
+*.csv
+triage_candidates/
