@@ -42,6 +42,17 @@ UNSELECTABLE_INTRIN = re.compile(
 CALL_INSTR = re.compile(
     r"^\s*(?:%[\w.$-]+\s*=\s*)?(?:tail |musttail |notail )?(?:call|invoke|callbr)\s"
 )
+# The "interrupt" function attribute makes a function an ISR: special
+# prologue/epilogue + a non-standard return (mret/sret/uret) that backend-tv
+# models inconsistently, giving spurious "Value mismatch" on even trivial
+# bodies (the run2 `isr_user` cluster). Not an isel-rule signal -> drop it.
+INTERRUPT_ATTR = re.compile(r'"interrupt"')
+# undef / poison *constants* in the body create refinement false positives that
+# --disable-undef-input can't cover (it disables undef *inputs*, not literal
+# undef/poison): undef shift amounts (the fsh*_undef class) and `freeze poison`
+# (the pr161492 class) both yield spurious "Value mismatch"/"more defined".
+# Only ~2.9% of the clean-int corpus carries these, so the seed cost is small.
+UNDEF_POISON = re.compile(r"\b(?:undef|poison)\b")
 
 
 def is_clean_int_func(text):
@@ -54,6 +65,10 @@ def is_clean_int_func(text):
     if TARGET_INTRIN.search(text):
         return False
     if UNSELECTABLE_INTRIN.search(text):
+        return False
+    if INTERRUPT_ATTR.search(text):
+        return False
+    if UNDEF_POISON.search(text):
         return False
     for line in text.splitlines():
         if CALL_INSTR.match(line) and "@llvm." not in line:
