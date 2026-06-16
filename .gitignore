@@ -62,3 +62,4 @@ riscv_codegen_single_seeds/
 riscv_codegen_int_seeds/
 *.csv
 triage_candidates/
+distilled_int_seeds/
