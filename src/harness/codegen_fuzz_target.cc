@@ -42,6 +42,7 @@
 
 #include "src/mutators/corpus_index.h"
 #include "src/mutators/registry.h"
+#include "src/analysis/ir_feature_tuples.h"
 
 #include <atomic>
 #include <chrono>
@@ -318,6 +319,19 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   return 0;
 }
 
+// ── Input-feature steering (opt-in via REGATONI_IR_FEATURES=1) ──────────────
+// Emit one Centipede user feature per distinct IR context-tuple, so the fuzzer
+// is rewarded for reaching previously-unseen tuples — the df=0 frontier where
+// every confirmed bug lives. Same tuple logic as tools/ir_features.cc (shared
+// header) so steering features match the offline analysis exactly.
+static constexpr size_t kIRFeatCap = 4096;
+__attribute__((used, retain, section("__centipede_extra_features")))
+static uint64_t g_ir_extra_features[kIRFeatCap];
+static const bool g_emit_ir_features = [] {
+  const char *e = std::getenv("REGATONI_IR_FEATURES");
+  return e && e[0] == '1';
+}();
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   uint32_t mid = g_last_mutation_id;
   g_last_mutation_id = 0;
@@ -337,6 +351,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   if (mid != 0 && llvm::verifyModule(*M, nullptr)) {
     bumpStat(mid, kVerifyFail);
     return 0;
+  }
+
+  if (g_emit_ir_features) {
+    std::memset(g_ir_extra_features, 0, sizeof(g_ir_extra_features));
+    regatoni::ftEmitFeatureHashes(*M, g_ir_extra_features, kIRFeatCap, /*domain=*/0);
   }
 
   llvm::StripDebugInfo(*M);
