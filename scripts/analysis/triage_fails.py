@@ -76,21 +76,34 @@ def probe(ir_path, isel, wall, smt_to):
     return classify(out, rc)
 
 def label_reduced(text):
-    """Quick known-vs-new label from a reduced witness. The known GISel
-    mul_by_neg_one bug is `mul nuw` by -1 — mul is COMMUTATIVE, so -1 may be on
-    either side (`mul nuw i8 -1, %x` or `mul nuw i32 %x, -1`), and the -1 may be
-    computed (`or %x,-1` / `sext iN -1`). Match all of these."""
-    for ln in text.splitlines():
-        s = ln.strip()
-        if s.startswith(";"):
-            continue
-        if "mul nuw" in s and re.search(r"(^|[ ,])-1([ ,]|$)", s):
-            return "known-nuw"
+    """Label a reduced witness against the four known campaign-bug families so
+    re-finds stop showing as NEW?. Only a genuine 5th bug returns "NEW?".
+      bug1 known-nuw      : `mul nuw` by -1 (mul COMMUTATIVE, -1 either side, or
+                            computed via `or x,-1` / `sext iN -1`)
+      bug2 nowrap-negate  : `sub nuw`/`sub nsw` (the i31 no-wrap negate family)
+      bug3 satshift-freeze: out-of-range `[us]shl.sat` feeding a freeze
+      bug3 freeze-poison  : the general root — `freeze` of poison consumed by an
+                            `and` (the x&(x±1) idiom; ushl.sat is just one source)
+      bug4 negate-of-not  : `sub 0, (xor x,-1)` = -(~x), the dropped-negation fold
+    """
     body = "\n".join(l for l in text.splitlines() if not l.strip().startswith(";"))
+    # bug1: mul nuw by -1, on either operand, possibly computed
+    for ln in body.splitlines():
+        if "mul nuw" in ln and re.search(r"(^|[ ,])-1([ ,]|$)", ln):
+            return "known-nuw"
     if ("mul nuw" in body) and re.search(r"(or i\d+ %\w+, -1|sext i\d+ -1)", body):
         return "known-nuw"
+    # bug4: negate of a not  -(~x)
+    if re.search(r"xor i\d+ %\w+, -1", body) and re.search(r"sub i\d+ 0,", body):
+        return "negate-of-not"
+    # bug2: no-wrap negate
+    if re.search(r"\bsub n[us]w\b", body):
+        return "nowrap-negate"
+    # bug3: out-of-range saturating shift, then general freeze-of-poison
     if re.search(r"\b[us]shl\.sat", body):
         return "satshift-freeze"
+    if ("freeze" in body) and re.search(r"\band i\d+", body):
+        return "freeze-poison"
     return "NEW?"
 
 def main():
