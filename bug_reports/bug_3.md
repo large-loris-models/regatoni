@@ -51,4 +51,6 @@ f:
 ```
 The source is always even (`V & (V-1)`); with `arg0 = 0` SelectionDAG returns `-1` (odd), which the source can never produce
 
+**Note**: the saturating shift is incidental — the real issue is that `freeze` of any poison value is not pinned across its two uses, so `freeze(poison) & (freeze(poison)-1)` is lowered to `x - 1`; with a plain poison source such as `shl i32 %x, 32` (or a bare `poison`) *both* selectors exhibit it, and GlobalISel only avoids it above because it happens to materialize the saturating shift
+
 **CC**: @regehr
