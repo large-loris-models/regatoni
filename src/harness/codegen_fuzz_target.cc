@@ -43,6 +43,7 @@
 #include "src/mutators/corpus_index.h"
 #include "src/mutators/registry.h"
 #include "src/analysis/ir_feature_tuples.h"
+#include "src/mutators/ir_mutations/graft_value.h"
 
 #include <atomic>
 #include <chrono>
@@ -422,4 +423,56 @@ extern "C" size_t LLVMFuzzerCustomMutator(uint8_t *Data, size_t Size,
   g_last_mutation_id = mutation_id;
   std::memcpy(Data, Out.data(), Out.size());
   return Out.size();
+}
+
+// Native two-parent crossover. Centipede calls this `crossover_level`% of the
+// time with TWO evolved corpus members. We graft a value sub-DAG from parent 2
+// (donor) into parent 1 (host) — true genetic crossover over the evolving
+// population, vs the GraftValue mutation which only grafts from the static seed
+// library. Both parents parse into one context, so no bitcode round-trip.
+extern "C" size_t LLVMFuzzerCustomCrossOver(const uint8_t *Data1, size_t Size1,
+                                            const uint8_t *Data2, size_t Size2,
+                                            uint8_t *Out, size_t MaxOutSize,
+                                            unsigned int Seed) {
+  if (Size1 == 0 || Size2 == 0)
+    return 0;
+  llvm::SMDiagnostic E1, E2;
+  auto HostBuf = llvm::MemoryBuffer::getMemBufferCopy(
+      llvm::StringRef(reinterpret_cast<const char *>(Data1), Size1), "host");
+  auto Host = llvm::parseIR(*HostBuf, E1, *Ctx);
+  if (!Host)
+    return 0;
+  auto DonorBuf = llvm::MemoryBuffer::getMemBufferCopy(
+      llvm::StringRef(reinterpret_cast<const char *>(Data2), Size2), "donor");
+  auto Donor = llvm::parseIR(*DonorBuf, E2, *Ctx);
+  if (!Donor)
+    return 0;
+  llvm::StripDebugInfo(*Host);
+  llvm::StripDebugInfo(*Donor);
+
+  auto firstDefined = [](llvm::Module &M) -> llvm::Function * {
+    for (auto &F : M)
+      if (!F.isDeclaration() && !F.empty())
+        return &F;
+    return nullptr;
+  };
+  llvm::Function *HF = firstDefined(*Host);
+  llvm::Function *DF = firstDefined(*Donor);
+  if (!HF || !DF)
+    return 0;
+
+  std::mt19937 rng(Seed);
+  if (!regatoni::graftGadgetInto(*HF, *DF, rng))
+    return 0;
+  if (llvm::verifyModule(*Host, nullptr))
+    return 0;
+
+  std::string Str("; regatoni-crossover: graft\n");
+  llvm::raw_string_ostream OS(Str);
+  Host->print(OS, nullptr);
+  OS.flush();
+  if (Str.size() > MaxOutSize)
+    return 0;
+  std::memcpy(Out, Str.data(), Str.size());
+  return Str.size();
 }
