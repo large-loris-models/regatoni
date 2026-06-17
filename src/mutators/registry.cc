@@ -19,6 +19,8 @@
 #include "src/mutators/ir_mutations/arith_identity_substitution.h"
 #include "src/mutators/ir_mutations/narrow_then_widen.h"
 #include "src/mutators/ir_mutations/demote_intrinsic_to_expansion.h"
+// Crossover (global search): graft a value sub-DAG from a corpus donor.
+#include "src/mutators/ir_mutations/graft_value.h"
 // Pruned for the scalar-integer backend-isel campaign (2026-06-13):
 //   modify_attributes — injected interrupt/CC attrs -> backend-TV false positives
 //   mutate_gep        — pointer-only; never applies to the integer corpus
@@ -87,6 +89,7 @@ MutationRegistry &MutationRegistry::instance() {
     reg.add(std::make_unique<ArithIdentitySubstitution>());
     reg.add(std::make_unique<NarrowThenWiden>());
     reg.add(std::make_unique<DemoteIntrinsicToExpansion>());
+    reg.add(std::make_unique<GraftValue>());
     initialized = true;
   }
   return reg;

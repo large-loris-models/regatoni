@@ -34,6 +34,11 @@ public:
   // For canApply: cheap predicate.
   bool has_matching(llvm::FunctionType *sig) const;
 
+  // Sample any indexed function regardless of signature (for gadget-graft
+  // crossover, which transplants a value sub-DAG rather than a whole call).
+  // Lives in the library context — caller must clone into the destination.
+  llvm::Function *sample_any(std::mt19937 &rng) const;
+
   llvm::LLVMContext &context() { return ctx_; }
 
   size_t num_modules() const { return num_modules_; }

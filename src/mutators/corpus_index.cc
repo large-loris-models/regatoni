@@ -157,4 +157,18 @@ llvm::Function *CorpusIndex::sample_matching(llvm::FunctionType *sig,
   return it->second[pick(rng)];
 }
 
+llvm::Function *CorpusIndex::sample_any(std::mt19937 &rng) const {
+  if (functions_by_sig_.empty())
+    return nullptr;
+  // Pick a random signature bucket, then a random function within it.
+  std::uniform_int_distribution<size_t> pickBucket(0,
+                                                   functions_by_sig_.size() - 1);
+  auto it = functions_by_sig_.begin();
+  std::advance(it, pickBucket(rng));
+  if (it->second.empty())
+    return nullptr;
+  std::uniform_int_distribution<size_t> pickFn(0, it->second.size() - 1);
+  return it->second[pickFn(rng)];
+}
+
 } // namespace regatoni
