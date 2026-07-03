@@ -7,7 +7,7 @@ Title: [RISC-V][GlobalISel] Miscompilation where a sign-extension that round-tri
 2. GlobalISel - https://godbolt.org/z/hq5xvodEb
 
 **Test Commit**
-[efb038f38f23ee201ac872ae98668c2ef922f0fa](https://github.com/llvm/llvm-project/commit/efb038f38f23ee201ac872ae98668c2ef922f0fa)
+[f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
 **Description**
 The function sign-extends an `i9` to `i16` (the `i128` round-trip and `mul ..., 1` are identities), but GlobalISel lowers it to `andi a0, a0, 511`, a zero-extending mask that drops the sign extension, so a negative input returns a positive result

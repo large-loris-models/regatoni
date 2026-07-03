@@ -7,7 +7,7 @@ Title: [RISC-V][GlobalISel] Miscompilation where a reassociated addition keeps a
 2. GlobalISel - <add link>
 
 **Test Commit**
-[efb038f38f23ee201ac872ae98668c2ef922f0fa](https://github.com/llvm/llvm-project/commit/efb038f38f23ee201ac872ae98668c2ef922f0fa)
+[f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
 **Description**
 Since `add nuw i16 %A, (1 - 2·%A)` equals `1 - %A`, the function computes `(1 - %A) & 1`, but GlobalISel reassociates the addition to `sub 1, %A` while keeping the `nuw` flag — which it cannot, since the original addition can be in-range while `1 - %A` wraps — and that false `nuw` lets a later combine treat `1 - %A` as already `0` or `1` and drop the `& 1`, returning the full `1 - %A`
