@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where a saturating left-shift is inco
 **Test Commit**
 [f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
+**Oracle**
+riscv-tv — AArch64 GlobalISel cannot legalize `ushl.sat` (it errors before codegen), so the miscompile is not observable there; only RISC-V legalizes the saturating shift and exposes the combine
+
 **Description**
 The function shifts `(ushl.sat(x, 1) & y)` left by one with `ushl.sat`, but GlobalISel's shift-of-shifted-logic combine treats the saturating shift like an ordinary shift and rewrites it to `ushl.sat(x, 2) & ushl.sat(y, 1)` — which is wrong because `ushl.sat` clamps on overflow instead of wrapping, so it does not distribute over the `and` and saturating `y` on its own changes the result
 

@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where an i31 no-wrap negation inside 
 **Test Commit**
 [efb038f38f23ee201ac872ae98668c2ef922f0fa](https://github.com/llvm/llvm-project/commit/efb038f38f23ee201ac872ae98668c2ef922f0fa)
 
+**Oracle**
+riscv-tv — AArch64 GlobalISel is correct; this is RISC-V's specific i31 no-unsigned-wrap-negate legalization path
+
 **Description**
 Since the `nuw` flag forces `sext(sub nuw i31 0, trunc %sel)` to 0, the function just returns `0`, but GlobalISel keeps the term and mis-lowers the i31 negate to a 32-bit `negw`, returning `-umin(a,y)`
 

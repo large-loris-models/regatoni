@@ -9,6 +9,9 @@ Title: [RISC-V][SelectionDAG] Miscompilation where a frozen poison value is dupl
 **Test Commit**
 [f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
+**Oracle**
+arm-tv, riscv-tv — also miscompiles on AArch64 SelectionDAG; the bug is in target-independent SelectionDAG freeze handling (`Select_FREEZE` lowered to a plain COPY)
+
 **Description**
 Since `llvm.ushl.sat.i32(x, 32)` shifts by the full bit width it is poison, so after `freeze` pins it to a single value the result `V & (V-1)` is always even, but SelectionDAG fails to pin the frozen value and returns `arg0 - 1` (odd for even `arg0`)
 

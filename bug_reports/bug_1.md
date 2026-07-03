@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where a bitwise-and of a value with i
 **Test Commit**
 [efb038f38f23ee201ac872ae98668c2ef922f0fa](https://github.com/llvm/llvm-project/commit/efb038f38f23ee201ac872ae98668c2ef922f0fa)
 
+**Oracle**
+arm-tv, riscv-tv — also miscompiles on AArch64 GlobalISel; the bug is in target-independent GlobalISel (`mul_by_neg_one` → `G_SUB` nuw known-bits → `redundant_and`)
+
 **Description**
 Since `mul nuw i32 x, -1` equals `-x`, the function is the lowest-set-bit idiom `x & -x`, but GlobalISel drops the `and` and returns just `-x`
 

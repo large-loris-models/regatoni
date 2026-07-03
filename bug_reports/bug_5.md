@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where a sign-extension that round-tri
 **Test Commit**
 [f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
+**Oracle**
+riscv-tv — AArch64 GlobalISel is correct; the `reduce_shl_of_extend` combine is gated by the target hook `isDesirableToPullExtFromShl`, which RISC-V enables and AArch64 does not
+
 **Description**
 The function sign-extends an `i9` to `i16` (the `i128` round-trip and `mul ..., 1` are identities), but GlobalISel lowers it to `andi a0, a0, 511`, a zero-extending mask that drops the sign extension, so a negative input returns a positive result
 

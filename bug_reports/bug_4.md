@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where a negation is dropped, turning 
 **Test Commit**
 [efb038f38f23ee201ac872ae98668c2ef922f0fa](https://github.com/llvm/llvm-project/commit/efb038f38f23ee201ac872ae98668c2ef922f0fa)
 
+**Oracle**
+arm-tv, riscv-tv — target-independent GlobalISel combine (`matchBinopWithNegInner`), so it reproduces on AArch64 as well
+
 **Description**
 Since `sub 0, (xor x, -1)` equals `x + 1`, the function is `x & (x + 1)`, but GlobalISel drops the negation and folds it to `andn x, x` (`x & ~x`, always 0)
 

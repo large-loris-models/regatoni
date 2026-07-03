@@ -9,6 +9,9 @@ Title: [RISC-V][GlobalISel] Miscompilation where bit-reversing an integer whose 
 **Test Commit**
 [f0ca72c6f4e177f735e6486f839acb296c4d02f0](https://github.com/llvm/llvm-project/commit/f0ca72c6f4e177f735e6486f839acb296c4d02f0)
 
+**Oracle**
+riscv-tv — AArch64 GlobalISel is correct; it widens `bitreverse` to i32 and uses native `rbit`, so only RISC-V routes a non-byte width to the byte-granular `lowerBitreverse`
+
 **Description**
 The function bit-reverses an `i17`, but GlobalISel lowers `llvm.bitreverse` by byte-swapping the value and applying byte-granular swap masks — which is only correct when the width is a multiple of 8 — so for a non-byte-multiple width the reversed bits land shifted from their correct positions
 
