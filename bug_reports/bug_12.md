@@ -3,8 +3,8 @@ Title: [RISCV][SelectionDAG] Miscompilation where the signed high multiply of an
 
 **Fuzzer Generated Test**
 **Reproducer**
-1. SelectionDAG - <Compiler Explorer link>
-2. GlobalISel - <Compiler Explorer link>
+1. SelectionDAG - https://godbolt.org/z/TK8obd5oM
+2. GlobalISel - https://godbolt.org/z/ej13GKWYM
 
 **Test Commit**
 [e633c7da8ff144a11b3d875956fbaea06b969070](https://github.com/llvm/llvm-project/commit/e633c7da8ff144a11b3d875956fbaea06b969070)
